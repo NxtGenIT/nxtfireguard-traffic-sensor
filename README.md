@@ -6,6 +6,13 @@ Configuration and management are handled through the [NxtFireGuard Dashboard](ht
 
 ---
 
+## Prerequisites
+
+* **Docker** installed and running
+* Access to **NxtFireGuard dashboard** to retrieve environment variables
+
+---
+
 ## Configuration
 
 To configure the Traffic Sensor, create a `.env` file in the same directory as your `docker-compose.yml` file. Include the following environment variables:
@@ -29,11 +36,7 @@ LOG_TO_LOKI=true
 LOKI_ADDRESS=https://loki.nxtfireguard.de
 ```
 
-### Notes
-
-* **TRAFFIC_SENSOR_NAME** should be a unique identifier for this sensor instance.
-* **AUTH_SECRET** and **HEARTBEAT_IDENTIFIER** are used for secure communication with NxtFireGuard services.
-* Logs are sent to a centralized **Loki** instance for monitoring and analysis.
+> **Note:** Missing environment variable values can be obtained from your **NxtFireGuard dashboard**.
 
 ---
 
@@ -75,6 +78,14 @@ volumes:
    ```bash
    docker compose logs -f
    ```
+
+
+---
+
+## Application Info
+
+**Name:** NxtFireGuard Traffic Sensor
+**Purpose:** Detect and report malicous IPs to NxtFireGuard.
 
 ---
 ---
