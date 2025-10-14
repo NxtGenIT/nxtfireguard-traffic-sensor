@@ -55,7 +55,7 @@ func SendHeartbeat(sensorName string, apikey string, identifier string, url stri
 		defer resp.Body.Close()
 
 		if resp.StatusCode == http.StatusOK {
-			zap.L().Info("Heartbeat request succeeded",
+			zap.L().Debug("Heartbeat request succeeded",
 				zap.Int("status", resp.StatusCode),
 			)
 			return nil // success

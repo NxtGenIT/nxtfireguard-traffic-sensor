@@ -36,9 +36,10 @@ func Sync(cfg *config.Config) error {
 	return nil
 }
 
-func Send(ip string, source types.Source, cfg *config.Config) error {
+func Send(ip string, relatedIp string, source types.Source, cfg *config.Config) error {
 	payload := struct {
 		Ip         string `json:"ip"`
+		RelatedIp  string `json:"relatedIp"`
 		SourceType string `json:"sourceType"`
 		SourceName string `json:"sourceName"`
 	}{
@@ -68,7 +69,7 @@ func Send(ip string, source types.Source, cfg *config.Config) error {
 	}
 	defer resp.Body.Close()
 
-	zap.L().Info("Sent alert successfully",
+	zap.L().Debug("Sent alert successfully",
 		zap.String("ip", ip),
 		zap.String("sourceType", source.SourceType),
 		zap.String("sourceName", source.SourceName),

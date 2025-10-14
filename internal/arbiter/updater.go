@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -55,7 +54,7 @@ func (u *UpdateStreamerImpl) GetConn() *websocket.Conn {
 }
 
 func (u *UpdateStreamerImpl) StartListening(cfg *config.Config, wm *whitelist.WhitelistManager) {
-	log.Print("[update] Started listening on websocket...")
+	zap.L().Info("[update] Started listening on websocket...")
 
 	// Channel for processing updates asynchronously
 	updateChan := make(chan Update, 100) // Buffer size to handle bursts
@@ -89,6 +88,14 @@ func (u *UpdateStreamerImpl) StartListening(cfg *config.Config, wm *whitelist.Wh
 			})
 
 			for {
+				// Check if connection is still the same before reading
+				currentConn := u.GetConn()
+				if currentConn != conn {
+					// Connection was replaced externally, exit this read loop
+					zap.L().Info("[update] Connection replaced, exiting read loop")
+					break
+				}
+
 				_, msg, err := conn.ReadMessage()
 				if err != nil {
 					if wsCloseErr, ok := err.(*websocket.CloseError); ok {
@@ -100,8 +107,9 @@ func (u *UpdateStreamerImpl) StartListening(cfg *config.Config, wm *whitelist.Wh
 					} else {
 						zap.L().Error("[update] Read error", zap.Error(err))
 					}
-					conn.Close() // force close to prevent zombie conn
+
 					u.SetConn(nil)
+					conn.Close()
 					break
 				}
 
@@ -126,7 +134,8 @@ func (u *UpdateStreamerImpl) StartListening(cfg *config.Config, wm *whitelist.Wh
 }
 
 func PingKeepalive(u *UpdateStreamerImpl, period time.Duration) {
-	log.Printf("[update] Starting config updater websocket keepalive pings every %s, ws client: %+v", period, u)
+	zap.L().Info("[update] Starting config updater websocket keepalive pings...")
+
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()
 
@@ -147,8 +156,8 @@ func PingKeepalive(u *UpdateStreamerImpl, period time.Duration) {
 		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 			zap.L().Warn("[update] Failed to send client ping, closing connection", zap.Error(err))
-			conn.Close()
 			u.SetConn(nil)
+			conn.Close()
 			return
 		}
 	}

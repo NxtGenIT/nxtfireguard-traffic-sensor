@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"time"
@@ -119,7 +118,7 @@ func recommend(cfg *config.Config, ip string, decisions []types.Decision) error 
 	return fmt.Errorf("request failed after %d attempts", maxRetries)
 }
 
-func EvaluateAndAct(cfg *config.Config, ip string, source types.Source) {
+func EvaluateAndAct(cfg *config.Config, ip string, relatedIp string, source types.Source) {
 	start := time.Now()
 
 	zap.L().Debug("Evaluating IP", zap.String("ip", ip))
@@ -129,14 +128,13 @@ func EvaluateAndAct(cfg *config.Config, ip string, source types.Source) {
 		zap.L().Debug("Not a valid IP Address, skipping",
 			zap.String("ip", ip),
 		)
+		return
 	}
 
 	decisions, score := recommender.ShouldBlock(ip)
 
-	log.Printf("score: %v", score)
-
 	if score >= alert.AlertThreshold {
-		err := alert.Send(ip, source, cfg)
+		err := alert.Send(ip, relatedIp, source, cfg)
 		if err != nil {
 			zap.L().Error("Error sending alert", zap.Error(err))
 		}

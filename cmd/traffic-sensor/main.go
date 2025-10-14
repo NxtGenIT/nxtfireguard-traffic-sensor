@@ -57,7 +57,6 @@ func main() {
 
 	// WS connection for receiving updates (IP-Scores, whitelists)
 	updaterWs := arbiter.NewUpdateStreamerImpl()
-	log.Printf("updater: %+v", updaterWs)
 
 	var wg sync.WaitGroup
 	wg.Add(2)

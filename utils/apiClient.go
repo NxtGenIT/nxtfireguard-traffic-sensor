@@ -48,7 +48,7 @@ func (c *APIClient) DoRequest(opts RequestOptions) (*http.Response, error) {
 	url := fmt.Sprintf("%s%s", c.cfg.NfgArbiterUrl, opts.Endpoint)
 	backoff := opts.InitBackoff
 
-	zap.L().Info("Starting API request",
+	zap.L().Debug("Starting API request",
 		zap.String("method", opts.Method),
 		zap.String("url", url),
 	)
@@ -92,7 +92,7 @@ func (c *APIClient) DoRequest(opts RequestOptions) (*http.Response, error) {
 
 		// Success case
 		if resp.StatusCode == http.StatusOK {
-			zap.L().Info("API request successful",
+			zap.L().Debug("API request successful",
 				zap.String("url", url),
 				zap.Int("status", resp.StatusCode),
 			)

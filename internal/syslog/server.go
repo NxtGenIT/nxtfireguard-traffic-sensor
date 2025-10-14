@@ -1,7 +1,6 @@
 package syslog
 
 import (
-	"log"
 	"net"
 
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/config"
@@ -38,7 +37,7 @@ func StartSyslogServer(cfg *config.Config, whitelistManager *whitelist.Whitelist
 			zap.L().Debug("Received syslog message",
 				zap.Any("logParts", logParts),
 			)
-			src, dst, msg := inferSrcDst(logParts)
+			src, dst, _ := inferSrcDst(logParts)
 			if !recommender.ShouldProcessPacket(whitelistManager, src, dst) {
 				continue
 			}
@@ -54,18 +53,8 @@ func StartSyslogServer(cfg *config.Config, whitelistManager *whitelist.Whitelist
 				}
 			}
 
-			go arbiter.EvaluateAndAct(cfg, src, types.Source{SourceType: "syslog", SourceName: sourceAddr})
-			go arbiter.EvaluateAndAct(cfg, dst, types.Source{SourceType: "syslog", SourceName: sourceAddr})
-
-			info := types.PacketInfo{
-				Src:               src,
-				Dst:               dst,
-				CaptureSource:     "syslog",
-				TrafficSensorName: cfg.SensorName,
-				RawSyslogMessage:  &msg,
-			}
-
-			log.Print("info: %+v", info)
+			go arbiter.EvaluateAndAct(cfg, src, dst, types.Source{SourceType: "syslog", SourceName: sourceAddr})
+			go arbiter.EvaluateAndAct(cfg, dst, src, types.Source{SourceType: "syslog", SourceName: sourceAddr})
 		}
 	}(channel)
 
