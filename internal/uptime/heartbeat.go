@@ -16,7 +16,7 @@ func SendHeartbeat(sensorName string, apikey string, identifier string, url stri
 	maxRetries := 3
 	backoff := time.Second
 
-	zap.L().Debug("Sending heartbeat")
+	zap.L().Info("Sending heartbeat")
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		req, err = http.NewRequest("GET", fmt.Sprintf("%s/ping/%s", url, identifier), nil)

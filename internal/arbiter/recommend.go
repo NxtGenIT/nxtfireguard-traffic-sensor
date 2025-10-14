@@ -40,7 +40,7 @@ func recommend(cfg *config.Config, ip string, decisions []types.Decision) error 
 	maxRetries := 3
 	backoff := time.Second
 
-	zap.L().Debug("Sending recommendation request",
+	zap.L().Info("Sending recommendation request",
 		zap.String("ip", ip),
 		zap.String("url", fmt.Sprintf("%s/recommend", cfg.NfgArbiterHost)),
 		zap.Any("decisions", decisions),
@@ -82,7 +82,7 @@ func recommend(cfg *config.Config, ip string, decisions []types.Decision) error 
 		defer resp.Body.Close()
 
 		if resp.StatusCode == http.StatusOK {
-			zap.L().Info("Recommendation request succeeded",
+			zap.L().Debug("Recommendation request succeeded",
 				zap.String("ip", ip),
 				zap.Int("status", resp.StatusCode),
 			)
