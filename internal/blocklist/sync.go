@@ -11,8 +11,8 @@ import (
 	"go.uber.org/zap"
 )
 
-var storedBlocklists []types.Blocklist // Global storage
-var blocklistMutex sync.RWMutex        // For thread-safe access
+var storedBlocklists []types.Blocklist
+var blocklistMutex sync.RWMutex
 
 func Sync(cfg *config.Config) error {
 	client := utils.NewAPIClient(cfg)
