@@ -3,14 +3,19 @@ package arbiter
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/config"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/sqlite"
+	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/syslog"
+	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/traffic"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/types"
+	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/whitelist"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/utils"
 	"go.uber.org/zap"
 )
@@ -153,5 +158,89 @@ func ReSync(cfg *config.Config) error {
 	zap.L().Info("IP score sync completed successfully",
 		zap.Int("insertedRecords", len(allRecords)),
 	)
+	return nil
+}
+
+// ReloadSubsystems dynamically updates traffic and syslog based on config
+func ReloadSubsystems(rootCtx context.Context, cfg *config.Config, wm *whitelist.WhitelistManager, wg *sync.WaitGroup) {
+	controllers.mu.Lock()
+	defer controllers.mu.Unlock()
+
+	// === TRAFFIC MONITOR ===
+	if controllers.trafficCancel != nil {
+		controllers.trafficCancel() // stop traffic monitor
+		controllers.trafficCancel = nil
+		zap.L().Info("Stopped traffic monitoring")
+	}
+
+	if cfg.SniffTraffic {
+		ctx, cancel := context.WithCancel(rootCtx)
+		controllers.trafficCancel = cancel
+
+		// DON'T call wg.Add(1) here - this is for reloadable subsystems
+		go func() {
+			// DON'T call defer wg.Done() here
+			zap.L().Info("Started traffic monitoring")
+			var subsystemWg sync.WaitGroup // Use local WaitGroup
+			subsystemWg.Add(1)
+			traffic.MonitorAllInterfaces(ctx, cfg, wm, EvaluateAndAct, &subsystemWg)
+			subsystemWg.Wait()
+			zap.L().Info("Traffic monitoring goroutine exited")
+		}()
+	}
+
+	// === SYSLOG ===
+	if controllers.syslogCancel != nil {
+		controllers.syslogCancel() // stop syslog
+		controllers.syslogCancel = nil
+		zap.L().Info("Stopped syslog server")
+	}
+
+	if cfg.RunSyslog {
+		ctx, cancel := context.WithCancel(context.Background())
+		controllers.syslogCancel = cancel
+
+		// DON'T call wg.Add(1) here either
+		go func() {
+			// DON'T call defer wg.Done() here
+			zap.L().Info("Started syslog server")
+			var subsystemWg sync.WaitGroup // Use local WaitGroup
+			subsystemWg.Add(1)
+			syslog.StartSyslogServer(ctx, cfg, wm, EvaluateAndAct, &subsystemWg)
+			subsystemWg.Wait()
+			zap.L().Info("Syslog server goroutine exited")
+		}()
+	}
+
+	zap.L().Info("Subsystem reload complete")
+}
+
+func SyncSensorConfig(rootCtx context.Context, cfg *config.Config, whitelistManager *whitelist.WhitelistManager, wg *sync.WaitGroup) error {
+	client := utils.NewAPIClient(cfg)
+
+	resp, err := client.DoRequest(utils.RequestOptions{
+		Endpoint: "/sync",
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var response types.SyncResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		zap.L().Error("Failed to decode alert threshold response", zap.Error(err))
+		return fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if cfg.SniffTraffic != response.SniffTraffic || cfg.RunSyslog != response.RunSyslog {
+		cfg.SniffTraffic = response.SniffTraffic
+		cfg.RunSyslog = response.RunSyslog
+		ReloadSubsystems(rootCtx, cfg, whitelistManager, wg) // Pass wg but don't use it
+	}
+
+	// Update alert threshold
+	cfg.AlertThreshold = response.AlertThreshold
+
+	zap.L().Info("Stored alert threshold", zap.Int("threshold", int(cfg.AlertThreshold)))
 	return nil
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -14,8 +15,6 @@ import (
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/arbiter"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/bootstrap"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/sqlite"
-	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/syslog"
-	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/traffic"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/uptime"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/whitelist"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/utils"
@@ -26,14 +25,19 @@ import (
 func main() {
 	fmt.Print(assets.LogoContent)
 
-	// Setup shutdown hook
+	var wg sync.WaitGroup
+
+	// Root context for shutdown
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+
+	// Shutdown hook
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
-
 	go func() {
 		<-stopChan
-		zap.L().Info("Received termination signal, exiting...")
-		os.Exit(0)
+		zap.L().Info("Received termination signal, shutting down...")
+		rootCancel()
 	}()
 
 	godotenv.Load()
@@ -51,48 +55,66 @@ func main() {
 
 	wm := whitelist.NewWhitelistManager()
 
-	if err := bootstrap.InitializeSystem(cfg, wm); err != nil {
+	if err := bootstrap.InitializeSystem(rootCtx, cfg, wm, &wg); err != nil {
 		zap.L().Fatal("Startup failed", zap.Error(err))
 	}
 
-	// WS connection for receiving updates (IP-Scores, whitelists)
+	// WS connection for receiving updates
 	updaterWs := arbiter.NewUpdateStreamerImpl()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// Start interface monitor in a goroutine
-	go func() {
-		defer wg.Done()
-		traffic.MonitorAllInterfaces(cfg, wm)
-	}()
-
-	// Start syslog server in a goroutine
-	go func() {
-		defer wg.Done()
-		syslog.StartSyslogServer(cfg, wm)
-	}()
+	// Start initial services dynamically
+	if err := arbiter.SyncSensorConfig(rootCtx, cfg, wm, nil); err != nil {
+		zap.L().Error("Failed to perform initial runtime control sync", zap.Error(err))
+	}
 
 	// Start Update Web Socket
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := arbiter.StartUpdateWebSocketClient(cfg, wm, updaterWs)
+		err := arbiter.StartUpdateWebSocketClient(rootCtx, cfg, wm, updaterWs, &wg)
 		if err != nil {
 			zap.L().Fatal("Updater WebSocket client failed to start", zap.Error(err))
-			os.Exit(1)
+		}
+	}()
+
+	// Periodically sync in case the WebSocket missed updates
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-rootCtx.Done():
+				zap.L().Info("Config sync loop exiting")
+				return
+			case <-ticker.C:
+				if err := arbiter.SyncSensorConfig(rootCtx, cfg, wm, nil); err != nil {
+					zap.L().Error("Failed to sync sensor config", zap.Error(err))
+				}
+			}
 		}
 	}()
 
 	// Start sending heartbeats
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for {
-			uptime.SendHeartbeat(cfg.SensorName, cfg.AuthSecret, cfg.HeartbeatIdentifier, cfg.HeartbeatUrl)
-			<-ticker.C
+			select {
+			case <-rootCtx.Done():
+				zap.L().Info("Heartbeat loop exiting")
+				return
+			case <-ticker.C:
+				uptime.SendHeartbeat(cfg.SensorName, cfg.AuthSecret, cfg.HeartbeatIdentifier, cfg.HeartbeatUrl)
+			}
 		}
 	}()
 
+	<-rootCtx.Done()
+	zap.L().Info("Shutdown signal received, waiting for goroutines...")
 	wg.Wait()
+	zap.L().Info("All goroutines finished, exiting")
 }

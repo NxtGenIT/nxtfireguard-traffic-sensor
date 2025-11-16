@@ -1,5 +1,7 @@
 package types
 
+import "github.com/NxtGenIT/nxtfireguard-traffic-sensor/config"
+
 // Indicates the source on which we received a traffic event
 type Source struct {
 	SourceType string `json:"source_type"` // syslog or interface
@@ -25,7 +27,9 @@ type BlocklistsResponse struct {
 	Blocklists []Blocklist `json:"blocklists"`
 }
 
-type AlertThresholdResponse struct {
+type SyncResponse struct {
+	SniffTraffic   bool  `json:"sniffTraffic"`
+	RunSyslog      bool  `json:"runSyslog"`
 	AlertThreshold int32 `json:"alertThreshold"`
 }
 
@@ -113,3 +117,6 @@ type PacketInfo struct {
 type WhitelistResponse struct {
 	CIDRs []string `json:"cidrs"`
 }
+
+// EvaluationFunc is a callback for evaluating traffic
+type EvaluationFunc func(cfg *config.Config, direction string, ip1, ip2 string, source Source)
