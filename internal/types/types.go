@@ -1,6 +1,10 @@
 package types
 
-import "github.com/NxtGenIT/nxtfireguard-traffic-sensor/config"
+import (
+	"time"
+
+	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/config"
+)
 
 // Indicates the source on which we received a traffic event
 type Source struct {
@@ -34,8 +38,15 @@ type SyncResponse struct {
 }
 
 type ScoreRecord struct {
-	IP       string `json:"ip"`
-	NFGScore int32  `json:"nfg_score"`
+	IP          string    `json:"ip"`
+	NFGScore    int32     `json:"nfg_score"`
+	LastUpdated time.Time `json:"last_updated"`
+}
+
+type ScoreDBRecord struct {
+	IP        string    `json:"ip"`
+	NFGScore  int32     `json:"nfg_score"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type PacketInfo struct {

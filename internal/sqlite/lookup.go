@@ -1,21 +1,30 @@
 package sqlite
 
 import (
-	"database/sql"
 	"fmt"
-	"strings"
+	"math"
 	"time"
 
+	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/types"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"go.uber.org/zap"
 )
 
 type cachedScore struct {
-	score    int32
-	cachedAt time.Time
+	score     int32
+	updatedAt time.Time
+	cachedAt  time.Time
 }
 
 const cacheTTL = 5 * time.Minute
+
+// Decay configuration
+const (
+	// Score decays to 50% after this duration
+	decayHalfLife = 72 * time.Hour // 3 days
+	// Minimum score multiplier (prevents score from going to 0)
+	minDecayMultiplier = 0.3 // Score can decay to 30% of original
+)
 
 var ScoreCache *lru.Cache[string, cachedScore]
 
@@ -31,19 +40,53 @@ func InitCache(maxEntries int) error {
 
 	zap.L().Info("Initialized score cache",
 		zap.Int("maxEntries", maxEntries),
+		zap.Duration("cacheTTL", cacheTTL),
+		zap.Duration("decayHalfLife", decayHalfLife),
 	)
+
 	ScoreCache = cache
 	return nil
 }
 
-func Lookup(ip string) (*int32, error) {
-	// dev return 90 for dev
-	if strings.HasPrefix(ip, "172.22") {
-		var score *int32 = new(int32)
-		*score = 90
-		return score, nil
+// calculateDecayMultiplier applies exponential decay based on time since last update
+func calculateDecayMultiplier(updatedAt time.Time) float64 {
+	hoursOld := time.Since(updatedAt).Hours()
+
+	// Exponential decay: multiplier = 0.5^(hours/halfLife)
+	decay := math.Pow(0.5, hoursOld/decayHalfLife.Hours())
+
+	// Apply minimum multiplier floor
+	if decay < minDecayMultiplier {
+		decay = minDecayMultiplier
 	}
 
+	return decay
+}
+
+// applyDecay applies time-based decay to the score
+func applyDecay(originalScore int32, updatedAt time.Time) int32 {
+	if originalScore == 0 {
+		return 0
+	}
+
+	multiplier := calculateDecayMultiplier(updatedAt)
+	decayedScore := float64(originalScore) * multiplier
+
+	// Round to nearest integer
+	result := int32(math.Round(decayedScore))
+
+	zap.L().Debug("Applied time-based decay to score",
+		zap.Int32("originalScore", originalScore),
+		zap.Time("updatedAt", updatedAt),
+		zap.Float64("decayMultiplier", multiplier),
+		zap.Int32("decayedScore", result),
+		zap.Duration("age", time.Since(updatedAt)),
+	)
+
+	return result
+}
+
+func Lookup(ip string) (*int32, error) {
 	if ScoreCache == nil {
 		zap.L().Error("Score cache not initialized",
 			zap.String("ip", ip),
@@ -51,23 +94,31 @@ func Lookup(ip string) (*int32, error) {
 		return nil, fmt.Errorf("cache initialized init")
 	}
 
+	// Check cache
 	if entry, ok := ScoreCache.Get(ip); ok {
 		if time.Since(entry.cachedAt) < cacheTTL {
+			// Apply decay to cached score
+			decayedScore := applyDecay(entry.score, entry.updatedAt)
+
 			zap.L().Debug("Score retrieved from cache",
 				zap.String("ip", ip),
-				zap.Int32("score", entry.score),
+				zap.Int32("originalScore", entry.score),
+				zap.Int32("decayedScore", decayedScore),
+				zap.Time("updatedAt", entry.updatedAt),
 				zap.Time("cachedAt", entry.cachedAt),
 			)
-			return &entry.score, nil
+
+			return &decayedScore, nil
 		}
+
 		zap.L().Debug("Cache entry expired, falling back to DB",
 			zap.String("ip", ip),
 			zap.Time("cachedAt", entry.cachedAt),
 		)
-		// cache miss, fall through to DB
 	}
 
-	score, err := DBLookup(ip)
+	// Cache miss, fetch from DB
+	record, err := DBLookup(ip)
 	if err != nil {
 		zap.L().Error("Failed to lookup score from DB",
 			zap.String("ip", ip),
@@ -76,42 +127,47 @@ func Lookup(ip string) (*int32, error) {
 		return nil, err
 	}
 
-	// Store in cache
-	if score != nil {
-		ScoreCache.Add(ip, cachedScore{score: *score, cachedAt: time.Now()})
-		zap.L().Debug("Score stored in cache",
-			zap.String("ip", ip),
-			zap.Int32("score", *score),
-		)
-	}
+	// Store in cache with original score and updated_at timestamp
+	ScoreCache.Add(ip, cachedScore{
+		score:     record.NFGScore,
+		updatedAt: record.UpdatedAt,
+		cachedAt:  time.Now(),
+	})
 
-	return score, nil
+	zap.L().Debug("Score stored in cache",
+		zap.String("ip", ip),
+		zap.Int32("score", record.NFGScore),
+		zap.Time("updatedAt", record.UpdatedAt),
+	)
+
+	// Apply decay before returning
+	decayedScore := applyDecay(record.NFGScore, record.UpdatedAt)
+
+	return &decayedScore, nil
 }
 
-func DBLookup(ip string) (*int32, error) {
-	var score int32
+func DBLookup(ip string) (types.ScoreDBRecord, error) {
+	var record types.ScoreDBRecord
 	db := GetDB()
 
-	query := "SELECT score FROM ip_scores WHERE ip = ?"
+	query := "SELECT ip, nfg_score, updated_at FROM ip_scores WHERE ip = ?"
 	row := db.QueryRow(query, ip)
-	err := row.Scan(&score)
+
+	err := row.Scan(&record.IP, &record.NFGScore, &record.UpdatedAt)
 	if err != nil {
-		// If no record is found, return 0
-		if err == sql.ErrNoRows {
-			zero := int32(0)
-			return &zero, nil
-		}
-		// For other errors, log and return error
 		zap.L().Error("Failed to scan DB row for IP score",
 			zap.String("ip", ip),
 			zap.Error(err),
 		)
-		return nil, err
+		return types.ScoreDBRecord{}, err
 	}
 
 	zap.L().Debug("Score retrieved from DB",
 		zap.String("ip", ip),
-		zap.Int32("score", score),
+		zap.Int32("score", record.NFGScore),
+		zap.Time("updatedAt", record.UpdatedAt),
+		zap.Duration("age", time.Since(record.UpdatedAt)),
 	)
-	return &score, nil
+
+	return record, nil
 }
