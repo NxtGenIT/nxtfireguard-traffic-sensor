@@ -21,7 +21,7 @@ func BulkUpsertIpScores(records []types.ScoreRecord) error {
 		return err
 	}
 
-	stmt, err := tx.Prepare("INSERT OR REPLACE INTO ip_scores (ip, score) VALUES (?, ?)")
+	stmt, err := tx.Prepare("INSERT OR REPLACE INTO ip_scores (updated_at, ip, score) VALUES (?, ?, ?)")
 	if err != nil {
 		zap.L().Error("Failed to prepare statement for bulk upsert",
 			zap.Int("recordCount", len(records)),
@@ -32,8 +32,9 @@ func BulkUpsertIpScores(records []types.ScoreRecord) error {
 	defer stmt.Close()
 
 	for _, rec := range records {
-		if _, err := stmt.Exec(rec.IP, rec.NFGScore); err != nil {
+		if _, err := stmt.Exec(rec.LastUpdated, rec.IP, rec.NFGScore); err != nil {
 			zap.L().Error("Failed to execute statement for record",
+				zap.Time("last_updated", rec.LastUpdated),
 				zap.String("ip", rec.IP),
 				zap.Int32("score", rec.NFGScore),
 				zap.Error(err),
@@ -71,7 +72,7 @@ func UpsertIpScore(record types.ScoreRecord) error {
 		return err
 	}
 
-	stmt, err := tx.Prepare("INSERT OR REPLACE INTO ip_scores (ip, score) VALUES (?, ?)")
+	stmt, err := tx.Prepare("INSERT OR REPLACE INTO ip_scores (updated_at, ip, score) VALUES (?, ?, ?)")
 	if err != nil {
 		zap.L().Error("Failed to prepare statement for upsert",
 			zap.Error(err),
@@ -80,8 +81,9 @@ func UpsertIpScore(record types.ScoreRecord) error {
 	}
 	defer stmt.Close()
 
-	if _, err := stmt.Exec(record.IP, record.NFGScore); err != nil {
+	if _, err := stmt.Exec(record.LastUpdated, record.IP, record.NFGScore); err != nil {
 		zap.L().Error("Failed to execute statement for record",
+			zap.Time("last_updated", record.LastUpdated),
 			zap.String("ip", record.IP),
 			zap.Int32("score", record.NFGScore),
 			zap.Error(err),
