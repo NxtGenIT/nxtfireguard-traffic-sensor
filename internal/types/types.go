@@ -39,13 +39,13 @@ type SyncResponse struct {
 
 type ScoreRecord struct {
 	IP          string    `json:"ip"`
-	NFGScore    int32     `json:"nfg_score"`
+	NFGScore    int32     `json:"score"`
 	LastUpdated time.Time `json:"last_updated"`
 }
 
 type ScoreDBRecord struct {
 	IP        string    `json:"ip"`
-	NFGScore  int32     `json:"nfg_score"`
+	NFGScore  int32     `json:"score"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 

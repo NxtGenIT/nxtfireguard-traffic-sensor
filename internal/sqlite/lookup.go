@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"database/sql"
 	"fmt"
 	"math"
 	"time"
@@ -20,10 +21,8 @@ const cacheTTL = 5 * time.Minute
 
 // Decay configuration
 const (
-	// Score decays to 50% after this duration
-	decayHalfLife = 72 * time.Hour // 3 days
-	// Minimum score multiplier (prevents score from going to 0)
-	minDecayMultiplier = 0.3 // Score can decay to 30% of original
+	decayHalfLife      = 72 * time.Hour
+	minDecayMultiplier = 0.3
 )
 
 var ScoreCache *lru.Cache[string, cachedScore]
@@ -91,7 +90,7 @@ func Lookup(ip string) (*int32, error) {
 		zap.L().Error("Score cache not initialized",
 			zap.String("ip", ip),
 		)
-		return nil, fmt.Errorf("cache initialized init")
+		return nil, fmt.Errorf("score cache not initialized")
 	}
 
 	// Check cache
@@ -120,6 +119,14 @@ func Lookup(ip string) (*int32, error) {
 	// Cache miss, fetch from DB
 	record, err := DBLookup(ip)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			zap.L().Debug("No score found in DB for IP, returning 0",
+				zap.String("ip", ip),
+			)
+			defaultScore := int32(0)
+			return &defaultScore, nil
+		}
+
 		zap.L().Error("Failed to lookup score from DB",
 			zap.String("ip", ip),
 			zap.Error(err),
@@ -150,11 +157,18 @@ func DBLookup(ip string) (types.ScoreDBRecord, error) {
 	var record types.ScoreDBRecord
 	db := GetDB()
 
-	query := "SELECT ip, nfg_score, updated_at FROM ip_scores WHERE ip = ?"
+	query := "SELECT ip, score, updated_at FROM ip_scores WHERE ip = ?"
 	row := db.QueryRow(query, ip)
 
 	err := row.Scan(&record.IP, &record.NFGScore, &record.UpdatedAt)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			zap.L().Debug("No score found in DB for IP",
+				zap.String("ip", ip),
+			)
+			return types.ScoreDBRecord{}, err
+		}
+
 		zap.L().Error("Failed to scan DB row for IP score",
 			zap.String("ip", ip),
 			zap.Error(err),
