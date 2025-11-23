@@ -73,8 +73,22 @@ func (u *UpdateStreamerImpl) StartListening(rootCtx context.Context, cfg *config
 	}
 
 	go func() {
+		conn := u.GetConn()
+		defer func() {
+			if r := recover(); r != nil {
+				zap.L().Error("Recovered from panic in websocket read loop", zap.Any("recover", r))
+				u.SetConn(nil)
+				if conn != nil {
+					conn.Close()
+				}
+			}
+		}()
 		for {
-			conn := u.GetConn()
+			currentConn := u.GetConn()
+			if currentConn != conn {
+				zap.L().Info("[update] Connection replaced, exiting read loop")
+				break
+			}
 			if conn == nil {
 				time.Sleep(2 * time.Second)
 				continue

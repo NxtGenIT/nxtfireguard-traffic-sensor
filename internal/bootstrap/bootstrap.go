@@ -14,7 +14,13 @@ import (
 )
 
 func InitializeSystem(rootCtx context.Context, cfg *config.Config, wm *whitelist.WhitelistManager, wg *sync.WaitGroup) error {
-	if err := arbiter.SyncSensorConfig(rootCtx, cfg, wm, wg); err != nil {
+	// Init SQL IP Score cache
+	if err := sqlite.InitCache(cfg.IpScoreCacheSize); err != nil {
+		return err
+	}
+
+	// Init Recommendations cache
+	if err := arbiter.InitRecommendCache(cfg.RecommendationsCacheSize); err != nil {
 		return err
 	}
 
@@ -33,13 +39,8 @@ func InitializeSystem(rootCtx context.Context, cfg *config.Config, wm *whitelist
 		return err
 	}
 
-	// Init SQL IP Score cache
-	if err := sqlite.InitCache(cfg.IpScoreCacheSize); err != nil {
-		return err
-	}
-
-	// Init Recommendations cache
-	if err := arbiter.InitRecommendCache(cfg.RecommendationsCacheSize); err != nil {
+	// Sync sensor config and start services
+	if err := arbiter.SyncSensorConfig(rootCtx, cfg, wm, wg); err != nil {
 		return err
 	}
 
