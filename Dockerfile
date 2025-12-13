@@ -1,5 +1,5 @@
 # --- Build Stage ---
-FROM --platform=linux/amd64 golang:1.23-bookworm AS builder
+FROM --platform=linux/amd64 golang:1.24-bookworm AS builder
 
 # Install Go, libpcap-dev, gcc, and CA certificates
 RUN apt-get update && \
