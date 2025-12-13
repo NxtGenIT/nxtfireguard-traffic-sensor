@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/config"
@@ -99,11 +100,53 @@ func (c *APIClient) DoRequest(opts RequestOptions) (*http.Response, error) {
 			return resp, nil
 		}
 
-		// Non-200 status code
-		resp.Body.Close()
+		// Handle rate limiting with exponential backoff
+		if resp.StatusCode == http.StatusTooManyRequests {
+			resp.Body.Close()
+
+			// Check for Retry-After header
+			retryAfter := resp.Header.Get("Retry-After")
+			var waitDuration time.Duration
+
+			if retryAfter != "" {
+				// Try parsing as seconds (integer)
+				if seconds, err := strconv.Atoi(retryAfter); err == nil {
+					waitDuration = time.Duration(seconds) * time.Second
+				} else {
+					// Try parsing as HTTP date
+					if retryTime, err := http.ParseTime(retryAfter); err == nil {
+						waitDuration = time.Until(retryTime)
+					}
+				}
+			}
+
+			// Fall back to exponential backoff if no valid Retry-After
+			if waitDuration <= 0 {
+				waitDuration = backoff
+			}
+
+			if attempt < opts.MaxRetries {
+				zap.L().Info("Rate limited, waiting before retry",
+					zap.Int("attempt", attempt+1),
+					zap.Int("maxRetries", opts.MaxRetries),
+					zap.String("url", url),
+					zap.Duration("waitDuration", waitDuration),
+				)
+				time.Sleep(waitDuration)
+				backoff *= 2
+				continue
+			}
+
+			zap.L().Warn("Rate limited after all retries",
+				zap.Int("maxRetries", opts.MaxRetries),
+				zap.String("url", url),
+			)
+			return nil, fmt.Errorf("rate limited after %d retries", opts.MaxRetries)
+		}
 
 		// Retry on 5xx errors
 		if resp.StatusCode >= 500 && attempt < opts.MaxRetries {
+			resp.Body.Close()
 			zap.L().Warn("Server error, retrying",
 				zap.Int("attempt", attempt+1),
 				zap.Int("maxRetries", opts.MaxRetries),
@@ -115,7 +158,13 @@ func (c *APIClient) DoRequest(opts RequestOptions) (*http.Response, error) {
 			continue
 		}
 
+		// Check for rate limit
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return nil, fmt.Errorf("API returned status %s", resp.Status)
+		}
+
 		// Non-retriable error
+		resp.Body.Close()
 		zap.L().Error("API returned non-retriable status",
 			zap.String("url", url),
 			zap.Int("status", resp.StatusCode),

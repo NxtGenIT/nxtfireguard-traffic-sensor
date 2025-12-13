@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/config"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/types"
@@ -69,15 +68,6 @@ func sendAlertInternal(ipType string, ip string, relatedIp string, source types.
 		return err
 	}
 	defer resp.Body.Close()
-
-	// Check for rate limit
-	if resp.StatusCode == http.StatusTooManyRequests {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return &RateLimitError{
-			StatusCode: resp.StatusCode,
-			Message:    string(bodyBytes),
-		}
-	}
 
 	if resp.StatusCode >= 400 {
 		bodyBytes, _ := io.ReadAll(resp.Body)

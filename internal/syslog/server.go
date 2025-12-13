@@ -50,7 +50,22 @@ func StartSyslogServer(ctx context.Context, cfg *config.Config, whitelistManager
 					zap.Any("logParts", logParts),
 				)
 				src, dst, _ := inferSrcDst(logParts)
+
+				// Early exit if no valid IPs were extracted
+				// Empty strings mean either no IPs found or IPs were filtered as invalid
+				if src == "" || dst == "" {
+					zap.L().Debug("Skipping message: no valid source/destination",
+						zap.String("src", src),
+						zap.String("dst", dst),
+					)
+					continue
+				}
+
 				if !recommender.ShouldProcessPacket(whitelistManager, src, dst) {
+					zap.L().Debug("Skipping message: filtered by whitelist",
+						zap.String("src", src),
+						zap.String("dst", dst),
+					)
 					continue
 				}
 

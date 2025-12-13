@@ -45,7 +45,7 @@ func Load() *Config {
 		IpScoreCacheSize:         getEnvInt("IP_SCORE_CACHE_SIZE", 1000),
 		RecommendationsCacheSize: getEnvInt("RECOMMENDATIONS_CACHE_SIZE", 100),
 		LogToLoki:                logToLoki,
-		LokiAddress:              getEnv("LOKI_ADDRESS", "loki.nxtfireguard.de"),
+		LokiAddress:              getEnv("LOKI_ADDRESS", "https://loki.nxtfireguard.de"),
 		WsKeepalivePeriod:        30 * time.Second,
 	}
 
