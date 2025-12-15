@@ -1,8 +1,11 @@
 package bootstrap
 
 import (
+	"context"
+	"sync"
+
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/config"
-	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/alert"
+
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/arbiter"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/blocklist"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/sqlite"
@@ -10,9 +13,14 @@ import (
 	"go.uber.org/zap"
 )
 
-func InitializeSystem(cfg *config.Config, wm *whitelist.WhitelistManager) error {
-	// Sync Alert Threshold
-	if err := alert.Sync(cfg); err != nil {
+func InitializeSystem(rootCtx context.Context, cfg *config.Config, wm *whitelist.WhitelistManager, wg *sync.WaitGroup) error {
+	// Init SQL IP Score cache
+	if err := sqlite.InitCache(cfg.IpScoreCacheSize); err != nil {
+		return err
+	}
+
+	// Init Recommendations cache
+	if err := arbiter.InitRecommendCache(cfg.RecommendationsCacheSize); err != nil {
 		return err
 	}
 
@@ -31,13 +39,8 @@ func InitializeSystem(cfg *config.Config, wm *whitelist.WhitelistManager) error 
 		return err
 	}
 
-	// Init SQL IP Score cache
-	if err := sqlite.InitCache(cfg.IpScoreCacheSize); err != nil {
-		return err
-	}
-
-	// Init Recommendations cache
-	if err := arbiter.InitRecommendCache(cfg.RecommendationsCacheSize); err != nil {
+	// Sync sensor config and start services
+	if err := arbiter.SyncSensorConfig(rootCtx, cfg, wm, wg); err != nil {
 		return err
 	}
 

@@ -31,6 +31,8 @@ func SendHeartbeat(sensorName string, apikey string, identifier string, url stri
 
 		req.Header.Set("apikey", apikey)
 
+		zap.L().Debug("heartbeat request", zap.Any("req:", req))
+
 		resp, err = http.DefaultClient.Do(req)
 		if err != nil {
 			zap.L().Warn("Request failed, retrying",

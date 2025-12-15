@@ -35,10 +35,10 @@ func generateCacheKey(ip string, decisions []types.Decision) string {
 		return decisions[i].Reason+decisions[i].Blocklist < decisions[j].Reason+decisions[j].Blocklist
 	})
 
-	// Serialize decisions to JSON or hash for compactness
+	// Serialize decisions to hash
 	decisionsJSON, _ := json.Marshal(decisions)
 	decisionsHash := sha256.Sum256(decisionsJSON)
-	hashStr := hex.EncodeToString(decisionsHash[:8]) // first 8 bytes for brevity
+	hashStr := hex.EncodeToString(decisionsHash[:8]) // first 8 bytes
 
 	return fmt.Sprintf("ip:%s:decisions:%s", ip, hashStr)
 }

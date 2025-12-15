@@ -18,22 +18,9 @@ Configuration and management are handled through the [NxtFireGuard Dashboard](ht
 To configure the Traffic Sensor, create a `.env` file in the same directory as your `docker-compose.yml` file. Include the following environment variables:
 
 ```env
-DEBUG=false
-
 TRAFFIC_SENSOR_NAME=
-
 AUTH_SECRET=
 HEARTBEAT_IDENTIFIER=
-
-HEARTBEAT_URL=https://heartbeat.nxtfireguard.de
-NFG_ARBITER_URL=https://arbiter.nxtfireguard.de
-NFG_ARBITER_HOST=arbiter.nxtfireguard.de
-STREAMING_SKIP_VERIFY_TLS=false
-SQLITE_DB_PATH=/data/ip_scores.db
-IP_SCORE_CACHE_SIZE=1000
-RECOMMENDATIONS_CACHE_SIZE=100
-LOG_TO_LOKI=true
-LOKI_ADDRESS=https://loki.nxtfireguard.de
 ```
 
 > **Note:** Missing environment variable values can be obtained from your **NxtFireGuard dashboard**.
