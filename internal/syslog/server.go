@@ -1,6 +1,7 @@
 package syslog
 
 import (
+	"fmt"
 	"net"
 
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/config"
@@ -28,8 +29,8 @@ func StartSyslogServer(cfg *config.Config, whitelistManager *whitelist.Whitelist
 	server := syslog.NewServer()
 	server.SetFormat(syslog.Automatic)
 	server.SetHandler(handler)
-	server.ListenUDP("0.0.0.0:514")
-	server.ListenTCP("0.0.0.0:514")
+	server.ListenUDP(fmt.Sprintf("%s:%d", cfg.SyslogBindAddress, cfg.SyslogPort))
+	server.ListenTCP(fmt.Sprintf("%s:%d", cfg.SyslogBindAddress, cfg.SyslogPort))
 	server.Boot()
 
 	go func(channel syslog.LogPartsChannel) {

@@ -22,6 +22,8 @@ type Config struct {
 	LogToLoki                bool
 	LokiAddress              string
 	WsKeepalivePeriod        time.Duration
+	SyslogBindAddress        string
+	SyslogPort               int
 }
 
 func Load() *Config {
@@ -44,6 +46,8 @@ func Load() *Config {
 		LogToLoki:                logToLoki,
 		LokiAddress:              getEnv("LOKI_ADDRESS", "loki.nxtfireguard.nxtgenit.de"),
 		WsKeepalivePeriod:        30 * time.Second,
+		SyslogBindAddress:        getEnv("SYSLOG_BIND_ADDR", "0.0.0.0"),
+		SyslogPort:               getEnvInt("SYSLOG_PORT", 514),
 	}
 
 	return cfg
