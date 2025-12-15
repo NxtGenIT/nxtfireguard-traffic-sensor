@@ -16,11 +16,11 @@ import (
 func StartSyslogServer(cfg *config.Config, whitelistManager *whitelist.WhitelistManager) {
 	zap.L().Info("Starting Syslog Server",
 		zap.String("protocol", "udp"),
-		zap.String("address", "0.0.0.0:514"),
+		zap.String("address", fmt.Sprintf("%s:%d", cfg.SyslogBindAddress, cfg.SyslogPort)),
 	)
 	zap.L().Info("Starting Syslog Server",
 		zap.String("protocol", "tcp"),
-		zap.String("address", "0.0.0.0:514"),
+		zap.String("address", fmt.Sprintf("%s:%d", cfg.SyslogBindAddress, cfg.SyslogPort)),
 	)
 
 	channel := make(syslog.LogPartsChannel)
