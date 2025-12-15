@@ -1,11 +1,12 @@
 package syslog
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"sync"
 
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/config"
-	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/arbiter"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/recommender"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/types"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/whitelist"
@@ -13,14 +14,16 @@ import (
 	"gopkg.in/mcuadros/go-syslog.v2"
 )
 
-func StartSyslogServer(cfg *config.Config, whitelistManager *whitelist.WhitelistManager) {
+func StartSyslogServer(ctx context.Context, cfg *config.Config, whitelistManager *whitelist.WhitelistManager, evaluationFunc types.EvaluationFunc, wg *sync.WaitGroup) {
+	defer wg.Done()
+
 	zap.L().Info("Starting Syslog Server",
 		zap.String("protocol", "udp"),
-		zap.String("address", fmt.Sprintf("%s:%d", cfg.SyslogBindAddress, cfg.SyslogPort)),
+		zap.String("address", fmt.Sprintf("%s:%d", cfg.SyslogListenAddr, cfg.SyslogPort)),
 	)
 	zap.L().Info("Starting Syslog Server",
 		zap.String("protocol", "tcp"),
-		zap.String("address", fmt.Sprintf("%s:%d", cfg.SyslogBindAddress, cfg.SyslogPort)),
+		zap.String("address", fmt.Sprintf("%s:%d", cfg.SyslogListenAddr, cfg.SyslogPort)),
 	)
 
 	channel := make(syslog.LogPartsChannel)
@@ -29,35 +32,67 @@ func StartSyslogServer(cfg *config.Config, whitelistManager *whitelist.Whitelist
 	server := syslog.NewServer()
 	server.SetFormat(syslog.Automatic)
 	server.SetHandler(handler)
-	server.ListenUDP(fmt.Sprintf("%s:%d", cfg.SyslogBindAddress, cfg.SyslogPort))
-	server.ListenTCP(fmt.Sprintf("%s:%d", cfg.SyslogBindAddress, cfg.SyslogPort))
+	server.ListenUDP(fmt.Sprintf("%s:%d", cfg.SyslogListenAddr, cfg.SyslogPort))
+	server.ListenTCP(fmt.Sprintf("%s:%d", cfg.SyslogListenAddr, cfg.SyslogPort))
 	server.Boot()
 
+	// Goroutine to handle log messages
 	go func(channel syslog.LogPartsChannel) {
-		for logParts := range channel {
-			zap.L().Debug("Received syslog message",
-				zap.Any("logParts", logParts),
-			)
-			src, dst, _ := inferSrcDst(logParts)
-			if !recommender.ShouldProcessPacket(whitelistManager, src, dst) {
-				continue
-			}
+		for {
+			select {
+			case <-ctx.Done():
+				zap.L().Info("Syslog server stopping: context canceled")
+				return
+			case logParts, ok := <-channel:
+				if !ok {
+					return
+				}
+				zap.L().Debug("Received syslog message",
+					zap.Any("logParts", logParts),
+				)
+				src, dst, _ := inferSrcDst(logParts)
 
-			// Extract sender address from logParts["client"]
-			sourceAddr := "unknown"
-			if client, ok := logParts["client"]; ok {
-				if addr, ok := client.(net.Addr); ok {
-					sourceAddr = addr.String() // includes port
-					if host, _, err := net.SplitHostPort(sourceAddr); err == nil {
-						sourceAddr = host
+				// Early exit if no valid IPs were extracted
+				// Empty strings mean either no IPs found or IPs were filtered as invalid
+				if src == "" || dst == "" {
+					zap.L().Debug("Skipping message: no valid source/destination",
+						zap.String("src", src),
+						zap.String("dst", dst),
+					)
+					continue
+				}
+
+				if !recommender.ShouldProcessPacket(whitelistManager, src, dst) {
+					zap.L().Debug("Skipping message: filtered by whitelist",
+						zap.String("src", src),
+						zap.String("dst", dst),
+					)
+					continue
+				}
+
+				sourceAddr := "unknown"
+				if client, ok := logParts["client"]; ok {
+					if addr, ok := client.(net.Addr); ok {
+						sourceAddr = addr.String()
+						if host, _, err := net.SplitHostPort(sourceAddr); err == nil {
+							sourceAddr = host
+						}
 					}
 				}
-			}
 
-			go arbiter.EvaluateAndAct(cfg, src, dst, types.Source{SourceType: "syslog", SourceName: sourceAddr})
-			go arbiter.EvaluateAndAct(cfg, dst, src, types.Source{SourceType: "syslog", SourceName: sourceAddr})
+				go evaluationFunc(cfg, "source", src, dst, types.Source{SourceType: "syslog", SourceName: sourceAddr})
+				go evaluationFunc(cfg, "destination", dst, src, types.Source{SourceType: "syslog", SourceName: sourceAddr})
+			}
 		}
 	}(channel)
 
+	// Wait for stop signal
+	go func() {
+		<-ctx.Done()
+		zap.L().Info("Shutting down syslog server")
+		server.Kill()
+	}()
+
 	server.Wait()
+	zap.L().Info("Syslog server exited cleanly")
 }

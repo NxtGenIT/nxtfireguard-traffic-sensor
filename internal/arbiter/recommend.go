@@ -10,13 +10,32 @@ import (
 	"time"
 
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/config"
-	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/alert"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/recommender"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/types"
 	"go.uber.org/zap"
 )
 
+// recommend attempts to send a recommendation, queuing it for retry if rate limited
 func recommend(cfg *config.Config, ip string, decisions []types.Decision) error {
+	err := recommendInternal(cfg, ip, decisions)
+
+	// If rate limited, queue for retry
+	if err != nil && isRateLimitError(err) {
+		zap.L().Warn("Recommendation rate limited, queuing for retry",
+			zap.String("ip", ip),
+		)
+		GetRetryQueue(cfg).Add("recommendation", RecommendationData{
+			IP:        ip,
+			Decisions: decisions,
+		})
+		return nil // Don't return error since we queued it
+	}
+
+	return err
+}
+
+// recommendInternal is the actual HTTP call (used by retry queue)
+func recommendInternal(cfg *config.Config, ip string, decisions []types.Decision) error {
 	payload := struct {
 		IP        string           `json:"ip"`
 		Decisions []types.Decision `json:"decisions"`
@@ -34,20 +53,16 @@ func recommend(cfg *config.Config, ip string, decisions []types.Decision) error 
 		return fmt.Errorf("failed to marshal block report payload: %w", err)
 	}
 
-	var resp *http.Response
-	var req *http.Request
-
 	maxRetries := 3
 	backoff := time.Second
 
-	zap.L().Info("Sending recommendation request",
+	zap.L().Debug("Sending recommendation request",
 		zap.String("ip", ip),
-		zap.String("url", fmt.Sprintf("%s/recommend", cfg.NfgArbiterHost)),
-		zap.Any("decisions", decisions),
+		zap.String("url", fmt.Sprintf("%s/recommend", cfg.NfgArbiterUrl)),
 	)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		req, err = http.NewRequest("POST", fmt.Sprintf("%s/recommend", cfg.NfgArbiterUrl), bytes.NewBuffer(body))
+		req, err := http.NewRequest("POST", fmt.Sprintf("%s/recommend", cfg.NfgArbiterUrl), bytes.NewBuffer(body))
 		if err != nil {
 			zap.L().Error("Failed to create request",
 				zap.Error(err),
@@ -60,7 +75,7 @@ func recommend(cfg *config.Config, ip string, decisions []types.Decision) error 
 		req.Header.Set("X_AUTH_KEY", cfg.AuthSecret)
 		req.Header.Set("X_SENSOR_NAME", cfg.SensorName)
 
-		resp, err = http.DefaultClient.Do(req)
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			zap.L().Warn("Request failed, retrying",
 				zap.Int("attempt", attempt+1),
@@ -81,12 +96,21 @@ func recommend(cfg *config.Config, ip string, decisions []types.Decision) error 
 		}
 		defer resp.Body.Close()
 
+		// Check for rate limit - don't retry on 429, let caller queue it
+		if resp.StatusCode == http.StatusTooManyRequests {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			return &RateLimitError{
+				StatusCode: resp.StatusCode,
+				Message:    string(bodyBytes),
+			}
+		}
+
 		if resp.StatusCode == http.StatusOK {
 			zap.L().Debug("Recommendation request succeeded",
 				zap.String("ip", ip),
 				zap.Int("status", resp.StatusCode),
 			)
-			return nil // success
+			return nil
 		}
 
 		// Retry if status code is 5xx
@@ -101,7 +125,7 @@ func recommend(cfg *config.Config, ip string, decisions []types.Decision) error 
 			continue
 		}
 
-		// Read and return the error body if not retriable
+		// Non-retriable error
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		zap.L().Error("Non-retriable error from recommendation request",
 			zap.String("ip", ip),
@@ -118,7 +142,8 @@ func recommend(cfg *config.Config, ip string, decisions []types.Decision) error 
 	return fmt.Errorf("request failed after %d attempts", maxRetries)
 }
 
-func EvaluateAndAct(cfg *config.Config, ip string, relatedIp string, source types.Source) {
+// EvaluateAndAct evaluates an IP and takes appropriate action
+func EvaluateAndAct(cfg *config.Config, ipType string, ip string, relatedIp string, source types.Source) {
 	start := time.Now()
 
 	zap.L().Debug("Evaluating IP", zap.String("ip", ip))
@@ -133,8 +158,8 @@ func EvaluateAndAct(cfg *config.Config, ip string, relatedIp string, source type
 
 	decisions, score := recommender.ShouldBlock(ip)
 
-	if score >= alert.AlertThreshold {
-		err := alert.Send(ip, relatedIp, source, cfg)
+	if score >= cfg.AlertThreshold {
+		err := SendAlert(ipType, ip, relatedIp, source, cfg)
 		if err != nil {
 			zap.L().Error("Error sending alert", zap.Error(err))
 		}

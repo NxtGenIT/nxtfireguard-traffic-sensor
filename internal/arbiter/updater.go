@@ -1,6 +1,7 @@
 package arbiter
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -12,7 +13,6 @@ import (
 	"time"
 
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/config"
-	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/alert"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/blocklist"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/sqlite"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/types"
@@ -53,7 +53,7 @@ func (u *UpdateStreamerImpl) GetConn() *websocket.Conn {
 	return u.conn
 }
 
-func (u *UpdateStreamerImpl) StartListening(cfg *config.Config, wm *whitelist.WhitelistManager) {
+func (u *UpdateStreamerImpl) StartListening(rootCtx context.Context, cfg *config.Config, wm *whitelist.WhitelistManager, wg *sync.WaitGroup) {
 	zap.L().Info("[update] Started listening on websocket...")
 
 	// Channel for processing updates asynchronously
@@ -67,14 +67,28 @@ func (u *UpdateStreamerImpl) StartListening(cfg *config.Config, wm *whitelist.Wh
 				zap.L().Debug("[update] Worker processing update",
 					zap.Int("workerID", workerID),
 					zap.String("type", update.Type))
-				ProcessUpdate(cfg, wm, update)
+				ProcessUpdate(rootCtx, cfg, wm, update, wg)
 			}
 		}(i)
 	}
 
 	go func() {
+		conn := u.GetConn()
+		defer func() {
+			if r := recover(); r != nil {
+				zap.L().Error("Recovered from panic in websocket read loop", zap.Any("recover", r))
+				u.SetConn(nil)
+				if conn != nil {
+					conn.Close()
+				}
+			}
+		}()
 		for {
-			conn := u.GetConn()
+			currentConn := u.GetConn()
+			if currentConn != conn {
+				zap.L().Info("[update] Connection replaced, exiting read loop")
+				break
+			}
 			if conn == nil {
 				time.Sleep(2 * time.Second)
 				continue
@@ -158,12 +172,12 @@ func PingKeepalive(u *UpdateStreamerImpl, period time.Duration) {
 			zap.L().Warn("[update] Failed to send client ping, closing connection", zap.Error(err))
 			u.SetConn(nil)
 			conn.Close()
-			return
+			continue // next tick will check for new conn
 		}
 	}
 }
 
-func StartUpdateWebSocketClient(cfg *config.Config, wm *whitelist.WhitelistManager, updater *UpdateStreamerImpl) error {
+func StartUpdateWebSocketClient(rootCtx context.Context, cfg *config.Config, wm *whitelist.WhitelistManager, updater *UpdateStreamerImpl, wg *sync.WaitGroup) error {
 	var scheme string
 	if cfg.InsecureSkipVerifyTLS {
 		scheme = "ws"
@@ -224,7 +238,7 @@ func StartUpdateWebSocketClient(cfg *config.Config, wm *whitelist.WhitelistManag
 			PingKeepalive(updater, cfg.WsKeepalivePeriod)
 		}()
 
-		updater.StartListening(cfg, wm)
+		updater.StartListening(rootCtx, cfg, wm, wg)
 
 		// Wait until disconnected
 		for {
@@ -246,7 +260,7 @@ func StartUpdateWebSocketClient(cfg *config.Config, wm *whitelist.WhitelistManag
 	}
 }
 
-func ProcessUpdate(cfg *config.Config, wm *whitelist.WhitelistManager, data Update) {
+func ProcessUpdate(rootCtx context.Context, cfg *config.Config, wm *whitelist.WhitelistManager, data Update, wg *sync.WaitGroup) {
 	switch data.Type {
 	case "score-update":
 		var s ScoreUpdate
@@ -280,9 +294,9 @@ func ProcessUpdate(cfg *config.Config, wm *whitelist.WhitelistManager, data Upda
 			zap.L().Error("Failed to re-sync whitelists", zap.Error(err))
 			return
 		}
-	case "alert-threshold-update":
+	case "config-update":
 		zap.L().Info("[update] Processing alert-threshold-update")
-		if err := alert.Sync(cfg); err != nil {
+		if err := SyncSensorConfig(rootCtx, cfg, wm, wg); err != nil {
 			zap.L().Error("Failed to re-sync whitelists", zap.Error(err))
 			return
 		}
