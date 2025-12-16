@@ -47,14 +47,9 @@ func extractCiscoIosSrcDst(msg string) (src, dst string) {
 	return "", ""
 }
 
-// extractPfSenseSrcDst parses pfSense/OPNsense filterlog CSV format
-// Format: rule,sub-rule,anchor,tracker,interface,reason,action,dir,ipversion,...,srcip,dstip,...
-// Source IP is typically at index 17 (IPv4) or 18 (IPv6)
-// Destination IP is typically at index 18 (IPv4) or 19 (IPv6)
 func extractPfSenseSrcDst(msg string) (src, dst string) {
 	fields := strings.Split(msg, ",")
 
-	// pfSense filterlog format has IPs at different positions depending on IP version
 	if len(fields) < 19 {
 		return "", ""
 	}
