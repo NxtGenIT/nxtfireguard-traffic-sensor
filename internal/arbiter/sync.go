@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"time"
 
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/config"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/sqlite"
@@ -20,9 +19,10 @@ import (
 	"go.uber.org/zap"
 )
 
+const streamBatchSize = 10000
+
 func Sync(cfg *config.Config) error {
 	client := utils.NewAPIClient(cfg)
-
 	resp, err := client.DoRequest(utils.RequestOptions{
 		Endpoint: "/sync/score",
 	})
@@ -42,121 +42,135 @@ func Sync(cfg *config.Config) error {
 	defer gzr.Close()
 
 	tarReader := tar.NewReader(gzr)
-	var allRecords []types.ScoreRecord
 
+	// Use a channel to stream records for batch processing
+	recordChan := make(chan types.ScoreRecord, streamBatchSize)
+	errChan := make(chan error, 1)
+
+	// Start background goroutine to batch insert records
+	go func() {
+		errChan <- batchInsertFromChannel(recordChan)
+	}()
+
+	totalRecords := 0
+
+	// Stream through tar archive
 	for {
 		header, err := tarReader.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
+			close(recordChan)
+			<-errChan // Wait for goroutine to finish
 			zap.L().Error("Error reading from tar archive during sync", zap.Error(err))
 			return fmt.Errorf("error reading tar archive: %w", err)
 		}
+
 		if header.Typeflag != tar.TypeReg {
 			continue // skip non-regular files
 		}
 
-		data, err := io.ReadAll(tarReader)
-		if err != nil {
-			zap.L().Error("Failed to read file from tar archive",
+		// Stream JSON records from this file
+		decoder := json.NewDecoder(tarReader)
+
+		// Expect array of records
+		// Read opening bracket
+		if _, err := decoder.Token(); err != nil {
+			close(recordChan)
+			<-errChan
+			zap.L().Error("Failed to read JSON array start",
 				zap.String("filename", header.Name),
 				zap.Error(err),
 			)
-			return fmt.Errorf("failed to read file: %w", err)
+			return fmt.Errorf("failed to read json array start in '%s': %w", header.Name, err)
 		}
 
-		var records []types.ScoreRecord
-		if err := json.Unmarshal(data, &records); err != nil {
-			zap.L().Error("Failed to parse JSON file from sync archive",
+		// Stream individual records
+		for decoder.More() {
+			var record types.ScoreRecord
+			if err := decoder.Decode(&record); err != nil {
+				close(recordChan)
+				<-errChan
+				zap.L().Error("Failed to decode record",
+					zap.String("filename", header.Name),
+					zap.Error(err),
+				)
+				return fmt.Errorf("failed to decode record in '%s': %w", header.Name, err)
+			}
+
+			recordChan <- record
+			totalRecords++
+
+			// Log progress for large datasets
+			if totalRecords%100000 == 0 {
+				zap.L().Info("Sync progress",
+					zap.Int("recordsProcessed", totalRecords),
+				)
+			}
+		}
+
+		// Read closing bracket
+		if _, err := decoder.Token(); err != nil {
+			close(recordChan)
+			<-errChan
+			zap.L().Error("Failed to read JSON array end",
 				zap.String("filename", header.Name),
 				zap.Error(err),
 			)
-			return fmt.Errorf("failed to parse json file '%s': %w", header.Name, err)
-		}
-
-		allRecords = append(allRecords, records...)
-	}
-
-	zap.L().Info("Processed records from sync",
-		zap.Int("recordCount", len(allRecords)),
-	)
-
-	// Store in SQLite
-	if err := sqlite.BulkUpsertIpScores(allRecords); err != nil {
-		zap.L().Error("Bulk insert of IP scores failed",
-			zap.Int("recordCount", len(allRecords)),
-			zap.Error(err),
-		)
-		return fmt.Errorf("bulk insert failed: %w", err)
-	}
-
-	zap.L().Info("IP score sync completed successfully")
-	return nil
-}
-
-func ReSync(cfg *config.Config) error {
-	client := utils.NewAPIClient(cfg)
-
-	resp, err := client.DoRequest(utils.RequestOptions{
-		Endpoint: "/score-updates",
-	})
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		zap.L().Error("Failed to read response body", zap.Error(err))
-		return fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	type rawRecord struct {
-		IP        string    `json:"ip"`
-		Score     int32     `json:"score"`
-		Timestamp time.Time `json:"timestamp"`
-	}
-
-	var rawRecords []rawRecord
-	if err := json.Unmarshal(body, &rawRecords); err != nil {
-		zap.L().Error("Failed to parse response JSON", zap.Error(err))
-		return fmt.Errorf("failed to parse JSON: %w", err)
-	}
-
-	// Deduplicate: keep latest timestamp per IP
-	deduped := make(map[string]rawRecord)
-	for _, rec := range rawRecords {
-		if existing, found := deduped[rec.IP]; !found || rec.Timestamp.After(existing.Timestamp) {
-			deduped[rec.IP] = rec
+			return fmt.Errorf("failed to read json array end in '%s': %w", header.Name, err)
 		}
 	}
 
-	// Reformat for DB insert
-	var allRecords []types.ScoreRecord
-	for _, rec := range deduped {
-		allRecords = append(allRecords, types.ScoreRecord{
-			IP:       rec.IP,
-			NFGScore: rec.Score,
-		})
-	}
+	// Close channel to signal completion
+	close(recordChan)
 
-	// Store into SQLite
-	if err := sqlite.BulkUpsertIpScores(allRecords); err != nil {
-		zap.L().Error("Bulk insert of IP scores failed",
-			zap.Int("recordCount", len(allRecords)),
+	// Wait for batch inserter to finish and check for errors
+	if err := <-errChan; err != nil {
+		zap.L().Error("Batch insert failed during sync",
+			zap.Int("totalRecords", totalRecords),
 			zap.Error(err),
 		)
-		return fmt.Errorf("bulk insert failed: %w", err)
-	}
-
-	// Remove new IPs from cache
-	for _, rec := range allRecords {
-		sqlite.ScoreCache.Remove(rec.IP)
+		return fmt.Errorf("batch insert failed: %w", err)
 	}
 
 	zap.L().Info("IP score sync completed successfully",
-		zap.Int("insertedRecords", len(allRecords)),
+		zap.Int("totalRecords", totalRecords),
+	)
+	return nil
+}
+
+func batchInsertFromChannel(recordChan <-chan types.ScoreRecord) error {
+	batch := make([]types.ScoreRecord, 0, streamBatchSize)
+	totalProcessed := 0
+
+	for record := range recordChan {
+		batch = append(batch, record)
+
+		// When batch is full, insert it
+		if len(batch) >= streamBatchSize {
+			if err := sqlite.BulkUpsertIpScores(batch); err != nil {
+				return err
+			}
+			totalProcessed += len(batch)
+			zap.L().Debug("Processed batch",
+				zap.Int("batchSize", len(batch)),
+				zap.Int("totalProcessed", totalProcessed),
+			)
+			batch = batch[:0] // Reset batch keeping capacity
+		}
+	}
+
+	// Insert remaining records
+	if len(batch) > 0 {
+		if err := sqlite.BulkUpsertIpScores(batch); err != nil {
+			return err
+		}
+		totalProcessed += len(batch)
+	}
+
+	zap.L().Info("Batch insertion completed",
+		zap.Int("totalProcessed", totalProcessed),
 	)
 	return nil
 }

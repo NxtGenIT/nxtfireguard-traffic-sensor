@@ -13,6 +13,7 @@ import (
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/assets"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/config"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/arbiter"
+	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/blocklist"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/bootstrap"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/sqlite"
 	"github.com/NxtGenIT/nxtfireguard-traffic-sensor/internal/uptime"
@@ -92,6 +93,16 @@ func main() {
 				if err := arbiter.SyncSensorConfig(rootCtx, cfg, wm, nil); err != nil {
 					zap.L().Error("Failed to sync sensor config", zap.Error(err))
 				}
+				if err := wm.Sync(cfg); err != nil {
+					zap.L().Error("Failed to sync whitelists", zap.Error(err))
+				}
+				if err := blocklist.Sync(cfg); err != nil {
+					zap.L().Error("Failed to sync blocklists", zap.Error(err))
+				}
+				if err := arbiter.Sync(cfg); err != nil {
+					zap.L().Error("Failed to sync ip-scores", zap.Error(err))
+				}
+
 			}
 		}
 	}()
