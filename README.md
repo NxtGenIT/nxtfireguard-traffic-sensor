@@ -8,8 +8,8 @@ Configuration and management are handled through the [NxtFireGuard Dashboard](ht
 
 ## Prerequisites
 
-* **Docker** installed and running
-* Access to **NxtFireGuard dashboard** to retrieve environment variables
+- **Docker** installed and running
+- Access to the **NxtFireGuard Dashboard** to retrieve environment variables
 
 ---
 
@@ -21,9 +21,12 @@ To configure the Traffic Sensor, create a `.env` file in the same directory as y
 TRAFFIC_SENSOR_NAME=
 AUTH_SECRET=
 HEARTBEAT_IDENTIFIER=
+SYSLOG_PORT=
 ```
 
-> **Note:** Missing environment variable values can be obtained from your **NxtFireGuard dashboard**.
+> **Note:** Missing environment variable values can be obtained from your **NxtFireGuard Dashboard**.
+
+> **Note:** If you are running the **NxtFireGuard Threat Feed Aggregator** on the same host, ensure `SYSLOG_PORT` is set to a value other than `514`, `1025`, or `1026`, as these ports are reserved by the Threat Feed Aggregator.
 
 ---
 
@@ -56,25 +59,23 @@ volumes:
 1. Clone this repository.
 2. Create a `.env` file with the required configuration.
 3. Run the following command to start the service:
-
    ```bash
    docker compose up -d
    ```
 4. Monitor logs using:
-
    ```bash
    docker compose logs -f
    ```
-
 
 ---
 
 ## Application Info
 
-**Name:** NxtFireGuard Traffic Sensor
-**Purpose:** Detect and report malicous IPs to NxtFireGuard.
+| Field   | Value                                          |
+|---------|------------------------------------------------|
+| Name    | NxtFireGuard Traffic Sensor                    |
+| Purpose | Detect and report malicious IPs to NxtFireGuard |
 
----
 ---
 
 ## License

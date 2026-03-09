@@ -47,7 +47,7 @@ func extractCiscoIosSrcDst(msg string) (src, dst string) {
 	return "", ""
 }
 
-func extractPfSenseSrcDst(msg string) (src, dst string) {
+func extractPfSrcDst(msg string) (src, dst string) {
 	fields := strings.Split(msg, ",")
 
 	if len(fields) < 19 {

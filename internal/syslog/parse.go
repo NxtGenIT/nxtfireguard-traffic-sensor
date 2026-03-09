@@ -65,16 +65,16 @@ func inferSrcDst(logParts map[string]interface{}) (src, dst, msg string) {
 		}
 	}
 
-	// Try to extract src/dst from pfSense filterlog format
-	if srcPf, dstPf := extractPfSenseSrcDst(msg); srcPf != "" && dstPf != "" {
+	// Try to extract src/dst from pf filterlog format
+	if srcPf, dstPf := extractPfSrcDst(msg); srcPf != "" && dstPf != "" {
 		if validSrc, validDst, srcInvalid, dstInvalid := validateSrcDst(srcPf, dstPf); validSrc != "" && validDst != "" {
-			zap.L().Debug("Extracted source and destination from pfSense",
+			zap.L().Debug("Extracted source and destination from pf log",
 				zap.String("src", validSrc),
 				zap.String("dst", validDst),
 			)
 			return validSrc, validDst, msg
 		} else if srcInvalid || dstInvalid {
-			zap.L().Debug("pfSense IPs found but filtered as invalid",
+			zap.L().Debug("pf IPs found but filtered as invalid",
 				zap.String("src", srcPf),
 				zap.String("dst", dstPf),
 				zap.Bool("srcInvalid", srcInvalid),
