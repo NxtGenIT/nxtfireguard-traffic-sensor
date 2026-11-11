@@ -1,0 +1,6 @@
+.git
+.github
+.env
+data
+sensor-db
+docker-compose.yml
