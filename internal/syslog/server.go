@@ -223,12 +223,12 @@ func (r *receiver) closeConns() {
 func (r *receiver) handle(line []byte, from net.Addr) {
 	msg, ok := content(line)
 	if !ok {
-		zap.L().Debug("syslog: unparsable message", zap.ByteString("line", line))
+		zap.L().Debug("syslog: unparsable message", zap.Int("bytes", len(line)), zap.ByteString("line", clip(line)))
 		return
 	}
 	src, dst, ok := Extract(msg)
 	if !ok {
-		zap.L().Debug("syslog: no address pair", zap.String("message", msg))
+		zap.L().Debug("syslog: no address pair", zap.Int("bytes", len(msg)), zap.ByteString("message", clip([]byte(msg))))
 		return
 	}
 	r.emit(flow.New(src, dst, nfg.Source{Type: "syslog", Name: host(from)}))
@@ -257,6 +257,16 @@ func message(parts format.LogParts) string {
 		}
 	}
 	return ""
+}
+
+// logClip bounds how much of an untrusted message reaches the debug log.
+const logClip = 256
+
+func clip(b []byte) []byte {
+	if len(b) > logClip {
+		return b[:logClip]
+	}
+	return b
 }
 
 func host(a net.Addr) string {

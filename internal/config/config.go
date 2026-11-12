@@ -74,9 +74,14 @@ func Load(lookup func(string) (string, bool)) (Config, []string, error) {
 		Workers:               e.int("EVALUATION_WORKERS", 8),
 		QueueSize:             e.int("EVALUATION_QUEUE_SIZE", 4096),
 	}
-	cfg.SyslogAddr = net.JoinHostPort(e.str("SYSLOG_LISTEN_ADDR", "0.0.0.0"), strconv.Itoa(e.int("SYSLOG_PORT", 514)))
+	port := e.int("SYSLOG_PORT", 514)
+	cfg.SyslogAddr = net.JoinHostPort(e.str("SYSLOG_LISTEN_ADDR", "0.0.0.0"), strconv.Itoa(port))
 
 	var errs []error
+	if port < 1 || port > 65535 {
+		// 0 would bind a random port no sender knows about.
+		errs = append(errs, fmt.Errorf("SYSLOG_PORT=%d is not a port (1-65535)", port))
+	}
 	if cfg.SensorName == "" {
 		errs = append(errs, errors.New("TRAFFIC_SENSOR_NAME is required"))
 	}

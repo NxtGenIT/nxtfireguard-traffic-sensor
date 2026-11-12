@@ -77,14 +77,14 @@ func TestLiveUpdateKeepsItsTimestamp(t *testing.T) {
 	if score(t, s, ip) != 0 {
 		t.Fatal("expected unknown IP") // also puts the miss in the cache
 	}
-	if err := s.Put(nfg.Score{IP: ip, Score: 90, LastUpdated: now.Add(-72 * time.Hour)}); err != nil {
+	if _, err := s.Put(nfg.Score{IP: ip, Score: 90, LastUpdated: now.Add(-72 * time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
 	if got := score(t, s, ip); got != 45 {
 		t.Fatalf("after put: %d, want 45 (cache must be invalidated, decay applied)", got)
 	}
 	// Without a timestamp the update counts as current, not as decades old.
-	if err := s.Put(nfg.Score{IP: ip, Score: 90}); err != nil {
+	if _, err := s.Put(nfg.Score{IP: ip, Score: 90}); err != nil {
 		t.Fatal(err)
 	}
 	if got := score(t, s, ip); got != 90 {
@@ -110,13 +110,13 @@ func TestReplaceAll(t *testing.T) {
 			return err
 		}
 		// Live updates arriving while the snapshot downloads.
-		if err := s.Put(nfg.Score{IP: "203.0.113.1", Score: 99, LastUpdated: now}); err != nil {
+		if _, err := s.Put(nfg.Score{IP: "203.0.113.1", Score: 99, LastUpdated: now}); err != nil {
 			return err
 		}
-		if err := s.Put(nfg.Score{IP: "203.0.113.3", Score: 55, LastUpdated: now}); err != nil {
+		if _, err := s.Put(nfg.Score{IP: "203.0.113.3", Score: 55, LastUpdated: now}); err != nil {
 			return err
 		}
-		if err := s.Put(nfg.Score{IP: "203.0.113.4", Score: 11, LastUpdated: now.Add(-time.Hour)}); err != nil {
+		if _, err := s.Put(nfg.Score{IP: "203.0.113.4", Score: 11, LastUpdated: now.Add(-time.Hour)}); err != nil {
 			return err
 		}
 		return add(nfg.Score{IP: "203.0.113.4", Score: 44, LastUpdated: now})
@@ -214,7 +214,7 @@ func TestSmallSnapshotIsMerged(t *testing.T) {
 
 func TestNormalizesIPKeys(t *testing.T) {
 	s := open(t)
-	if err := s.Put(nfg.Score{IP: "2001:0db8:0000::0001", Score: 70, LastUpdated: now}); err != nil {
+	if _, err := s.Put(nfg.Score{IP: "2001:0db8:0000::0001", Score: 70, LastUpdated: now}); err != nil {
 		t.Fatal(err)
 	}
 	if got := score(t, s, "2001:db8::1"); got != 70 {
@@ -307,5 +307,47 @@ func TestRepeatedSmallSnapshotsEventuallyReplace(t *testing.T) {
 	// 40 is the new baseline: 30 is no shrink worth merging.
 	if snap, err := s.ReplaceAll(ctx, snapshot(rows(30)...)); err != nil || snap.Merged {
 		t.Fatalf("%+v, %v", snap, err)
+	}
+}
+
+// A score-update queued behind a snapshot that already holds a newer row
+// must not roll the score back.
+func TestPutIgnoresOlderUpdates(t *testing.T) {
+	s := open(t)
+	if _, err := s.ReplaceAll(context.Background(), snapshot(nfg.Score{IP: "203.0.113.1", Score: 80, LastUpdated: now})); err != nil {
+		t.Fatal(err)
+	}
+	if score(t, s, "203.0.113.1") != 80 { // now cached
+		t.Fatal("snapshot row missing")
+	}
+	applied, err := s.Put(nfg.Score{IP: "203.0.113.1", Score: 10, LastUpdated: now.Add(-time.Minute)})
+	if err != nil || applied {
+		t.Fatalf("older update: applied=%v err=%v", applied, err)
+	}
+	if got := score(t, s, "203.0.113.1"); got != 80 {
+		t.Fatalf("score rolled back to %d", got)
+	}
+	applied, err = s.Put(nfg.Score{IP: "203.0.113.1", Score: 95, LastUpdated: now.Add(time.Minute)})
+	if err != nil || !applied {
+		t.Fatalf("newer update: applied=%v err=%v", applied, err)
+	}
+	if got := score(t, s, "203.0.113.1"); got != 95 {
+		t.Fatalf("newer update not served: %d", got)
+	}
+}
+
+// Half of an odd count: 2 of 5 is less than half and must merge.
+func TestHalfComparisonDoesNotTruncate(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	var five []nfg.Score
+	for i := range 5 {
+		five = append(five, nfg.Score{IP: netip.AddrFrom4([4]byte{198, 51, 100, byte(i)}).String(), Score: 50, LastUpdated: now})
+	}
+	if _, err := s.ReplaceAll(ctx, snapshot(five...)); err != nil {
+		t.Fatal(err)
+	}
+	if snap, err := s.ReplaceAll(ctx, snapshot(five[:2]...)); err != nil || !snap.Merged {
+		t.Fatalf("2 of 5: %+v, %v; want merged", snap, err)
 	}
 }

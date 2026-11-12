@@ -78,6 +78,10 @@ type Sensor struct {
 	snapshotAt   atomic.Int64 // unix nanos of the last snapshot start
 	droppedFlows atomic.Uint64
 
+	// haveScores is set once scores are usable: a snapshot loaded in this
+	// run, or scores kept from an earlier one.
+	haveScores atomic.Bool
+
 	configMu sync.Mutex
 	config   *nfg.SensorConfig
 }
@@ -116,6 +120,11 @@ func (s *Sensor) Submit(f flow.Flow) {
 
 // Run works until ctx ends.
 func (s *Sensor) Run(ctx context.Context) {
+	if ok, err := s.store.HasScores(); err != nil {
+		zap.L().Warn("cannot read the score store", zap.Error(err))
+	} else {
+		s.haveScores.Store(ok)
+	}
 	s.restoreState()
 	// The first snapshot starts right away; the first websocket connect
 	// must not queue a second one.
@@ -249,6 +258,9 @@ func (s *Sensor) syncScores(ctx context.Context) error {
 		zap.L().Warn("score snapshot has less than half the known IPs, merged instead of replaced", zap.Int("ips", snap.Rows))
 	}
 	zap.L().Info("score snapshot loaded", zap.Int("ips", snap.Rows), zap.Duration("took", time.Since(start)))
+	if !s.haveScores.Swap(true) {
+		s.reconcileComponents()
+	}
 	return nil
 }
 
@@ -260,8 +272,37 @@ func (s *Sensor) applyConfig(c nfg.SensorConfig) {
 	}
 	s.config = &c
 	s.policy.SetAlertThreshold(c.AlertThreshold)
-	s.sup.Set("capture", c.SniffTraffic, s.capture)
-	s.sup.Set("syslog", c.RunSyslog, s.syslog)
+	s.reconcileLocked()
+}
+
+// initialized reports whether the sensor can evaluate flows: it knows its
+// config, has the full rules and usable scores.
+func (s *Sensor) initialized() bool {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	return s.config != nil && s.policy.Load() != nil && s.haveScores.Load()
+}
+
+// reconcileComponents starts or stops capture and syslog as the config
+// says, but only once flows can be evaluated. Started earlier, capture
+// would mark live connections as seen while every flow is discarded or
+// scored 0, and those connections would stay hidden until idle.
+func (s *Sensor) reconcileComponents() {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	s.reconcileLocked()
+}
+
+func (s *Sensor) reconcileLocked() {
+	if s.config == nil {
+		return
+	}
+	ready := s.policy.Load() != nil && s.haveScores.Load()
+	if !ready {
+		zap.L().Debug("inputs wait for backend rules and scores")
+	}
+	s.sup.Set("capture", ready && s.config.SniffTraffic, s.capture)
+	s.sup.Set("syslog", ready && s.config.RunSyslog, s.syslog)
 }
 
 func (s *Sensor) applyBlocklists(l []nfg.Blocklist) {
@@ -269,6 +310,7 @@ func (s *Sensor) applyBlocklists(l []nfg.Blocklist) {
 		s.eval.ForgetAll()
 		zap.L().Info("blocklists", zap.Int("count", len(l)))
 	}
+	s.reconcileComponents()
 }
 
 func (s *Sensor) applyWhitelist(cidrs []string) {
@@ -276,6 +318,7 @@ func (s *Sensor) applyWhitelist(cidrs []string) {
 		zap.L().Warn("whitelist entries skipped, not CIDRs", zap.Strings("entries", bad))
 	}
 	zap.L().Debug("whitelist", zap.Int("cidrs", len(cidrs)))
+	s.reconcileComponents()
 }
 
 // restoreState applies the rules saved by the last run, if any.
@@ -357,11 +400,14 @@ func (s *Sensor) applyScoreUpdates(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case su := <-s.scoreUpdates:
-			if err := s.store.Put(nfg.Score{IP: su.IP, Score: su.Score, LastUpdated: su.Timestamp}); err != nil {
+			applied, err := s.store.Put(nfg.Score{IP: su.IP, Score: su.Score, LastUpdated: su.Timestamp})
+			if err != nil {
 				zap.L().Warn("cannot store score-update", zap.String("ip", su.IP), zap.Error(err))
 				continue
 			}
-			s.eval.Forget(su.IP)
+			if applied {
+				s.eval.Forget(su.IP)
+			}
 		}
 	}
 }
@@ -376,6 +422,12 @@ func (s *Sensor) heartbeat(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		}
+		// Not alive in any useful sense before it can evaluate flows (fresh
+		// volume, backend not answered yet), even with no input enabled.
+		if !s.initialized() {
+			zap.L().Warn("heartbeat skipped, no backend rules or scores yet")
+			continue
 		}
 		if broken := s.sup.NotReady(); len(broken) > 0 {
 			zap.L().Warn("heartbeat skipped, components not running", zap.Strings("components", broken))

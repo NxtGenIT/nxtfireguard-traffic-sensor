@@ -80,7 +80,9 @@ func TestOutboxRateLimitHoldsTheKind(t *testing.T) {
 		mu.Unlock()
 		return nil
 	}, nil)
-	eventually(t, "rate limit hit", limited.Load)
+	// Wait for the pause itself, not only for the 429: another sender
+	// could otherwise deliver r2 before holdKind ran.
+	eventually(t, "rate limit pause", func() bool { _, paused := o.pausedUntil(kindRecommendation); return paused })
 	o.Add(kindRecommendation, "r2", func(context.Context) error {
 		mu.Lock()
 		sentAt = append(sentAt, time.Since(start))
@@ -164,4 +166,23 @@ func TestOutboxCapacityIsPerKind(t *testing.T) {
 	if !o.Add(kindRecommendation, "r", func(context.Context) error { return nil }, nil) {
 		t.Fatal("a full alert queue must not block recommendations")
 	}
+}
+
+// Alerts stuck on a stalled backend must not hold up recommendations.
+func TestOutboxStalledAlertsDoNotBlockRecommendations(t *testing.T) {
+	o := runOutbox(t, 10) // 2 senders per kind
+	stall := make(chan struct{})
+	defer close(stall)
+	for _, k := range []string{"a1", "a2", "a3"} {
+		o.Add(kindAlert, k, func(ctx context.Context) error {
+			select {
+			case <-stall:
+			case <-ctx.Done():
+			}
+			return nil
+		}, nil)
+	}
+	var sent atomic.Bool
+	o.Add(kindRecommendation, "r", func(context.Context) error { sent.Store(true); return nil }, nil)
+	eventually(t, "recommendation while alerts stall", sent.Load)
 }

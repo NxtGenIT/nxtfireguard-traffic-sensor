@@ -302,3 +302,80 @@ func TestDecodeScoreArrayAcceptsNull(t *testing.T) {
 		t.Fatal("an object must be rejected")
 	}
 }
+
+func TestRedirectToAnotherHostKeepsTheSecret(t *testing.T) {
+	var leaked atomic.Bool
+	other := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X_AUTH_KEY") != "" || r.Header.Get("apikey") != "" {
+			leaked.Store(true)
+		}
+	}))
+	defer other.Close()
+	c := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sync/moved" {
+			_, _ = io.WriteString(w, `{"cidrs":[]}`)
+			return
+		}
+		target := other.URL + r.URL.Path
+		if r.URL.Path == "/sync/whitelist" {
+			target = "/sync/moved" // same origin: allowed
+		}
+		http.Redirect(w, r, target, http.StatusFound)
+	}))
+	if _, err := c.Whitelist(context.Background()); err != nil {
+		t.Fatalf("same-origin redirect refused: %v", err)
+	}
+	if _, err := c.Blocklists(context.Background()); !errors.Is(err, errRedirect) {
+		t.Errorf("cross-origin redirect: %v", err)
+	}
+	if err := c.Heartbeat(context.Background()); !errors.Is(err, errRedirect) {
+		t.Errorf("heartbeat cross-origin redirect: %v", err)
+	}
+	if leaked.Load() {
+		t.Fatal("credentials reached the other host")
+	}
+}
+
+func TestHeartbeatVerifiesTLSEvenWithTheOptOut(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{"cidrs":[]}`) }))
+	defer srv.Close()
+	cfg, _, err := config.Load(func(k string) (string, bool) {
+		v, ok := map[string]string{
+			"TRAFFIC_SENSOR_NAME":       "sensor-1",
+			"AUTH_SECRET":               "s3cret",
+			"NFG_ARBITER_URL":           srv.URL,
+			"HEARTBEAT_URL":             srv.URL,
+			"HEARTBEAT_IDENTIFIER":      "abc",
+			"STREAMING_SKIP_VERIFY_TLS": "true",
+		}[k]
+		return v, ok
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := New(cfg, "test")
+	c.Retries = 0
+	if _, err := c.Whitelist(context.Background()); err != nil {
+		t.Fatalf("backend with the opt-out: %v", err)
+	}
+	if err := c.Heartbeat(context.Background()); err == nil {
+		t.Fatal("heartbeat accepted an unverified certificate")
+	}
+}
+
+func TestScoreSnapshotBadChecksumFails(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	body := []byte(`[{"ip":"203.0.113.1","score":80}]`)
+	_ = tw.WriteHeader(&tar.Header{Name: "a.json", Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg})
+	_, _ = tw.Write(body)
+	_ = tw.Close()
+	_ = gz.Close()
+	data := buf.Bytes()
+	data[len(data)-8] ^= 0xff // CRC-32 in the gzip trailer
+	c := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(data) }))
+	if err := c.ScoreSnapshot(context.Background(), func(Score) error { return nil }); err == nil {
+		t.Fatal("a snapshot with a bad gzip checksum was accepted")
+	}
+}

@@ -62,7 +62,7 @@ func TestClassify(t *testing.T) {
 	}{
 		{"syn is always new", pkt{src: "203.0.113.1", dst: "10.0.0.1", sport: 1000, dport: 22, proto: "tcp", syn: true}, 0, true},
 		{"syn again is new again", pkt{src: "203.0.113.1", dst: "10.0.0.1", sport: 1000, dport: 22, proto: "tcp", syn: true}, 0, true},
-		{"syn-ack is tracked like any packet", pkt{src: "10.0.0.1", dst: "203.0.113.1", sport: 22, dport: 1000, proto: "tcp", syn: true, ack: true}, 0, true},
+		{"syn-ack answers the recorded syn", pkt{src: "10.0.0.1", dst: "203.0.113.1", sport: 22, dport: 1000, proto: "tcp", syn: true, ack: true}, 0, false},
 		{"reply of the tracked connection", pkt{src: "203.0.113.1", dst: "10.0.0.1", sport: 1000, dport: 22, proto: "tcp", ack: true}, 0, false},
 		{"mid-stream tcp without syn", pkt{src: "198.51.100.1", dst: "10.0.0.1", sport: 2000, dport: 443, proto: "tcp", ack: true}, 0, true},
 		{"udp first packet", pkt{src: "10.0.0.1", dst: "198.51.100.53", sport: 5353, dport: 53, proto: "udp"}, 0, true},

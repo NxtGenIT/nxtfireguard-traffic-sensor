@@ -85,3 +85,15 @@ func TestSecretNeverPrinted(t *testing.T) {
 		t.Fatal("Reveal")
 	}
 }
+
+func TestSyslogPortRange(t *testing.T) {
+	for _, p := range []string{"0", "-1", "65536"} {
+		vars := map[string]string{"SYSLOG_PORT": p}
+		for k, v := range minimal {
+			vars[k] = v
+		}
+		if _, _, err := load(vars); err == nil {
+			t.Errorf("SYSLOG_PORT=%s accepted", p)
+		}
+	}
+}

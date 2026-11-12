@@ -90,12 +90,7 @@ func (e *Evaluator) endpoint(p *policy.Policy, role string, ip, related netip.Ad
 		return
 	}
 
-	slices.SortFunc(blocks, func(a, b nfg.Decision) int {
-		return strings.Compare(a.Reason+a.Blocklist, b.Reason+b.Blocklist)
-	})
-	raw, _ := json.Marshal(blocks)
-	sum := sha256.Sum256(raw)
-	hash := hex.EncodeToString(sum[:8])
+	hash := decisionHash(blocks)
 	key := ip.String()
 	if prev, ok := e.recommended.Get(key); ok && prev == hash {
 		return
@@ -103,11 +98,45 @@ func (e *Evaluator) endpoint(p *policy.Policy, role string, ip, related netip.Ad
 	e.recommended.Add(key, hash)
 	r := nfg.Recommendation{IP: key, Decisions: blocks}
 	e.outbox.Add(kindRecommendation, "recommend|"+key+"|"+hash,
-		func(ctx context.Context) error { return e.backend.SendRecommendation(ctx, r) },
+		func(ctx context.Context) error {
+			// The message may have waited out a rate limit or retries. Send
+			// it only if it is still what the current rules and score say;
+			// if not, the change cleared the dedupe entry and the next
+			// connection recommends the current decision.
+			if !e.stillDecided(ip, hash) {
+				zap.L().Debug("recommendation outdated before delivery, dropped", zap.String("ip", key))
+				return nil
+			}
+			return e.backend.SendRecommendation(ctx, r)
+		},
 		func() {
 			// Not delivered: allow the next connection to try again.
 			if cur, ok := e.recommended.Peek(key); ok && cur == hash {
 				e.recommended.Remove(key)
 			}
 		})
+}
+
+// stillDecided reports whether ip would get the same block decisions now.
+func (e *Evaluator) stillDecided(ip netip.Addr, hash string) bool {
+	p := e.policy.Load()
+	if p == nil || p.Whitelisted(ip) {
+		return false
+	}
+	score, err := e.scores.Score(ip)
+	if err != nil {
+		return true // cannot tell; the decision was valid when made
+	}
+	_, blocks := p.Decide(ip, score)
+	return len(blocks) > 0 && decisionHash(blocks) == hash
+}
+
+// decisionHash identifies a set of decisions independent of their order.
+func decisionHash(blocks []nfg.Decision) string {
+	slices.SortFunc(blocks, func(a, b nfg.Decision) int {
+		return strings.Compare(a.Reason+a.Blocklist, b.Reason+b.Blocklist)
+	})
+	raw, _ := json.Marshal(blocks)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:8])
 }

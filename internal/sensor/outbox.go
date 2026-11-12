@@ -32,8 +32,9 @@ var kinds = []string{kindAlert, kindRecommendation}
 //
 // A message whose key is still waiting is dropped, and so is every new
 // message of a kind once Capacity messages of that kind are waiting. Each
-// kind has its own capacity so a flood of alerts cannot crowd out
-// recommendations (which are what actually block traffic).
+// kind has its own capacity, its own queue and its own senders, so a flood
+// of alerts against a stalled backend cannot delay recommendations (which
+// are what actually block traffic).
 type Outbox struct {
 	Capacity    int // per kind
 	MaxAttempts int
@@ -49,7 +50,7 @@ type Outbox struct {
 	delayed []*job
 	paused  map[string]time.Time
 	pause   map[string]time.Duration // current pause per kind, reset on success
-	ready   chan *job
+	ready   map[string]chan *job
 	now     func() time.Time
 
 	dropped atomic.Uint64
@@ -64,7 +65,7 @@ type job struct {
 }
 
 func NewOutbox(capacity int) *Outbox {
-	return &Outbox{
+	o := &Outbox{
 		Capacity:    capacity,
 		MaxAttempts: 10,
 		Backoff:     5 * time.Second,
@@ -76,17 +77,25 @@ func NewOutbox(capacity int) *Outbox {
 		perKind:     map[string]int{},
 		paused:      map[string]time.Time{},
 		pause:       map[string]time.Duration{},
-		// Every pending job is in ready, in delayed or being sent, so ready
-		// never holds more than all kinds' capacity together.
-		ready: make(chan *job, capacity*len(kinds)),
-		now:   time.Now,
+		ready:       map[string]chan *job{},
+		now:         time.Now,
 	}
+	for _, k := range kinds {
+		// Every pending job is in ready, in delayed or being sent, so a
+		// kind's queue never holds more than its capacity.
+		o.ready[k] = make(chan *job, capacity)
+	}
+	return o
 }
 
 // Add queues a message. giveUp, if set, runs when the message is dropped
 // for lack of room or after MaxAttempts. It reports whether the message
 // was queued.
 func (o *Outbox) Add(kind, key string, send func(context.Context) error, giveUp func()) bool {
+	ready, known := o.ready[kind]
+	if !known {
+		panic("outbox: unknown kind " + kind)
+	}
 	o.mu.Lock()
 	if _, dup := o.pending[key]; dup {
 		o.mu.Unlock()
@@ -103,26 +112,28 @@ func (o *Outbox) Add(kind, key string, send func(context.Context) error, giveUp 
 	j := &job{kind: kind, key: key, send: send, giveUp: giveUp}
 	o.pending[key] = j
 	o.perKind[kind]++
-	o.ready <- j // never blocks, see NewOutbox
+	ready <- j // never blocks, see NewOutbox
 	o.mu.Unlock()
 	return true
 }
 
-// Run delivers messages with the given number of concurrent senders until
-// ctx ends. Messages still waiting then are lost.
+// Run delivers messages with the given number of concurrent senders per
+// kind until ctx ends. Messages still waiting then are lost.
 func (o *Outbox) Run(ctx context.Context, senders int) {
 	var wg sync.WaitGroup
-	for range senders {
-		wg.Go(func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case j := <-o.ready:
-					o.deliver(ctx, j)
+	for _, ready := range o.ready {
+		for range senders {
+			wg.Go(func() {
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case j := <-ready:
+						o.deliver(ctx, j)
+					}
 				}
-			}
-		})
+			})
+		}
 	}
 
 	t := time.NewTicker(o.Tick)
@@ -227,7 +238,7 @@ func (o *Outbox) releaseDue() {
 		if now.Before(j.due) {
 			keep = append(keep, j)
 		} else {
-			o.ready <- j
+			o.ready[j.kind] <- j
 		}
 	}
 	clear(o.delayed[len(keep):])

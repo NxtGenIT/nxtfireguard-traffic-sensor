@@ -353,3 +353,25 @@ func TestFirstConnectDoesNotRefetch(t *testing.T) {
 		}
 	}
 }
+
+// A fresh volume with the backend down has nothing to evaluate with: the
+// inputs stay off and no heartbeat claims the sensor works. Once the
+// backend answers, both start.
+func TestFreshSensorWaitsForRulesAndScores(t *testing.T) {
+	b := newFakeBackend(t)
+	b.scores = []nfg.Score{{IP: "203.0.113.7", Score: 90, LastUpdated: time.Now()}}
+	b.down.Store(true)
+	r := startSensor(t, b, filepath.Join(t.TempDir(), "s.db"))
+	running := func() int {
+		r.sensor.sup.mu.Lock()
+		defer r.sensor.sup.mu.Unlock()
+		return len(r.sensor.sup.running)
+	}
+	time.Sleep(10 * heartbeatEvery)
+	if _, _, beats := b.got(); beats != 0 || running() != 0 {
+		t.Fatalf("backend down on a fresh volume: %d heartbeats, %d components", beats, running())
+	}
+	b.down.Store(false)
+	eventually(t, "inputs started", func() bool { return running() == 2 })
+	eventually(t, "heartbeat", func() bool { _, _, beats := b.got(); return beats > 0 })
+}

@@ -36,7 +36,7 @@ SYSLOG_PORT=
 | `DEBUG` | `false` | Debug logging |
 | `NFG_ARBITER_URL` | `https://arbiter.nxtfireguard.de` | Backend URL; the update websocket is derived from it |
 | `NFG_ARBITER_HOST` | empty | Websocket host (`host` or `host:port`), only if it differs from `NFG_ARBITER_URL`. The scheme still follows `NFG_ARBITER_URL`: `https` gives `wss`, `http` gives `ws` |
-| `STREAMING_SKIP_VERIFY_TLS` | `false` | Skip TLS certificate checks (test backends only) |
+| `STREAMING_SKIP_VERIFY_TLS` | `false` | Skip TLS certificate checks for the backend (test backends only). The heartbeat server is always verified |
 | `EVALUATION_WORKERS` / `EVALUATION_QUEUE_SIZE` | `8` / `4096` | Parallel evaluations and connections waiting for one |
 
 `LOG_TO_LOKI` and `LOKI_ADDRESS` are no longer used. The sensor logs JSON lines to stdout.
@@ -78,7 +78,8 @@ volumes:
 - An **alert** is sent when an IP's score reaches the alert threshold. A **recommendation** is sent for an IP again only when its score or its matching blocklists change. If the backend is unreachable or answers 5xx, they are retried with backoff (up to 10 attempts). If it rate-limits (HTTP 429), that kind of message is held back and the pause grows from 1s to 30s until the backend accepts again; nothing is dropped for that. A message the backend rejects with another 4xx is dropped and logged. Alerts and recommendations queue separately (`EVALUATION_QUEUE_SIZE` each), so an alert flood never delays blocking.
 - An empty score snapshot never wipes the local scores. A snapshot with less than half the IPs of the last full one is merged instead of replacing them (a truncated download must not unblock threats); after 3 such snapshots in a row the shrink is accepted. Rows written by earlier releases without a timestamp are served at the decay floor (30%), as before.
 - The last settings received from the backend are stored, so the sensor keeps working if the backend is unreachable when it starts.
-- A **heartbeat** is sent every minute while every enabled part (capture, syslog) is running.
+- A **heartbeat** is sent every minute once the sensor has its config, rules and scores (from the backend or saved by an earlier run), and while every enabled part (capture, syslog) is running. Capture and syslog also only start then, so a fresh sensor whose backend is unreachable stays quiet rather than reporting healthy.
+- Requests never follow a redirect to another host or from https to http, so the secret stays with the configured servers.
 
 ---
 

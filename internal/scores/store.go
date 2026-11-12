@@ -119,6 +119,16 @@ func Open(path string, cacheSize int) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// HasScores reports whether any score is stored, e.g. from an earlier run.
+func (s *Store) HasScores() (bool, error) {
+	var one int
+	err := s.db.QueryRow(`SELECT 1 FROM ip_scores LIMIT 1`).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // Score returns the decayed score of ip, or 0 if the backend has none.
 func (s *Store) Score(ip netip.Addr) (int32, error) {
 	key := ip.String()
@@ -145,19 +155,28 @@ func (s *Store) Score(ip netip.Addr) (int32, error) {
 	return Decay(c.score, c.updated, s.now()), nil
 }
 
-// Put stores a live score update.
-func (s *Store) Put(sc nfg.Score) error {
+// Put stores a live score update, unless the stored row is newer: an
+// update queued behind a snapshot that already has a later score must not
+// roll it back. It reports whether the update was applied.
+func (s *Store) Put(sc nfg.Score) (bool, error) {
 	key, at := s.normalize(sc)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.db.Exec(`INSERT OR REPLACE INTO ip_scores (ip, score, updated_at) VALUES (?, ?, ?)`, key, sc.Score, at); err != nil {
-		return err
+	res, err := s.db.Exec(`
+		INSERT INTO ip_scores (ip, score, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(ip) DO UPDATE SET score = excluded.score, updated_at = excluded.updated_at
+		WHERE excluded.updated_at >= ip_scores.updated_at OR ip_scores.updated_at IS NULL`, key, sc.Score, at)
+	if err != nil {
+		return false, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return false, err
 	}
 	if s.live != nil {
 		s.live[key] = struct{}{}
 	}
 	s.invalidate(func() { s.cache.Remove(key) })
-	return nil
+	return true, nil
 }
 
 // ReplaceAll swaps the whole table for a snapshot. fill streams the snapshot
@@ -266,7 +285,7 @@ func (s *Store) swap(ctx context.Context, rows int) (merged bool, err error) {
 	default:
 		_ = json.Unmarshal([]byte(raw), &base) // unreadable: no baseline
 	}
-	if rows < base.Rows/2 && base.Merges < maxMerges {
+	if rows*2 < base.Rows && base.Merges < maxMerges { // rows < half, without integer truncation
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO ip_scores_next (ip, score, updated_at) SELECT ip, score, updated_at FROM ip_scores`); err != nil {
 			return false, err
 		}

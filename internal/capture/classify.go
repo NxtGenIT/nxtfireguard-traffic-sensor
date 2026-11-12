@@ -58,10 +58,14 @@ func (c *Classifier) Classify(p gopacket.Packet) (src, dst netip.Addr, isNew boo
 	var sport, dport uint16
 	switch t := p.TransportLayer().(type) {
 	case *layers.TCP:
+		sport, dport = uint16(t.SrcPort), uint16(t.DstPort)
 		if t.SYN && !t.ACK {
+			// Always new (a retried or reused connection is a new attempt),
+			// but recorded, so the SYN-ACK and the rest of the handshake
+			// count as replies instead of a second flow with the ends swapped.
+			c.markSeen(proto, src, dst, sport, dport)
 			return src, dst, true
 		}
-		sport, dport = uint16(t.SrcPort), uint16(t.DstPort)
 	case *layers.UDP:
 		sport, dport = uint16(t.SrcPort), uint16(t.DstPort)
 	}

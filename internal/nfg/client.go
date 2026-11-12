@@ -29,9 +29,10 @@ type Client struct {
 	secret       config.Secret
 	userAgent    string
 
-	http     *http.Client
-	snapshot *http.Client
-	dialer   *websocket.Dialer
+	http      *http.Client
+	snapshot  *http.Client
+	heartbeat *http.Client
+	dialer    *websocket.Dialer
 
 	// Retries is how often a GET is repeated after a network error or a 5xx
 	// answer, waiting Backoff, 2*Backoff, ... in between. POSTs are not
@@ -64,6 +65,10 @@ func New(cfg config.Config, version string) *Client {
 	}
 	slow := transport.Clone()
 	slow.ResponseHeaderTimeout = 0
+	// The heartbeat server is configured separately and gets the secret
+	// too, so the TLS opt-out for a test backend does not extend to it.
+	verified := transport.Clone()
+	verified.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	return &Client{
 		baseURL:      cfg.ArbiterURL,
 		streamURL:    cfg.StreamURL,
@@ -72,8 +77,9 @@ func New(cfg config.Config, version string) *Client {
 		name:         cfg.SensorName,
 		secret:       cfg.AuthSecret,
 		userAgent:    "nfg-traffic-sensor/" + version,
-		http:         &http.Client{Transport: transport},
-		snapshot:     &http.Client{Transport: slow},
+		http:         &http.Client{Transport: transport, CheckRedirect: sameOrigin},
+		snapshot:     &http.Client{Transport: slow, CheckRedirect: sameOrigin},
+		heartbeat:    &http.Client{Transport: verified, CheckRedirect: sameOrigin},
 		dialer: &websocket.Dialer{
 			Proxy:            http.ProxyFromEnvironment,
 			HandshakeTimeout: 15 * time.Second,
@@ -170,7 +176,13 @@ func (c *Client) ScoreSnapshot(ctx context.Context, fn func(Score) error) error 
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return nil
+			// The tar end marker can come before the end of the gzip
+			// stream. Read to the end so a bad checksum or a truncated
+			// stream fails the snapshot instead of being committed.
+			if _, err := io.Copy(io.Discard, gz); err != nil {
+				return fmt.Errorf("score snapshot: %w", err)
+			}
+			return gz.Close()
 		}
 		if err != nil {
 			return fmt.Errorf("score snapshot: %w", err)
@@ -224,7 +236,7 @@ func (c *Client) Heartbeat(ctx context.Context) error {
 	}
 	ctx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	resp, err := c.send(ctx, c.http, http.MethodGet, c.heartbeatURL+"/ping/"+c.heartbeatID, nil, func(r *http.Request) {
+	resp, err := c.send(ctx, c.heartbeat, http.MethodGet, c.heartbeatURL+"/ping/"+c.heartbeatID, nil, func(r *http.Request) {
 		r.Header.Set("apikey", c.secret.Reveal())
 	}, 1)
 	if err != nil {
@@ -323,6 +335,23 @@ func (c *Client) send(ctx context.Context, hc *http.Client, method, url string, 
 			}
 		}
 	}
+}
+
+// errRedirect refuses a redirect that would carry the credentials elsewhere.
+var errRedirect = errors.New("redirect to another origin or to plain http refused")
+
+// sameOrigin lets a redirect through only to the same host, and never from
+// https to http. Go forwards custom headers such as X_AUTH_KEY and apikey
+// on redirects (it only strips Authorization and cookies across hosts).
+func sameOrigin(req *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return errors.New("too many redirects")
+	}
+	first := via[0].URL
+	if req.URL.Host != first.Host || (first.Scheme == "https" && req.URL.Scheme != "https") {
+		return fmt.Errorf("%w: %s -> %s://%s", errRedirect, first.Host, req.URL.Scheme, req.URL.Host)
+	}
+	return nil
 }
 
 // idleReader restarts timer on every read, so the timer only fires when
