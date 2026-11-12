@@ -260,3 +260,52 @@ func TestState(t *testing.T) {
 		t.Fatalf("got %v %v %v", ok, err, v)
 	}
 }
+
+// Rows of earlier releases carry no time; they were served at the floor
+// and must not jump back to full weight.
+func TestLegacyRowWithoutTimeIsAtTheFloor(t *testing.T) {
+	if got := Decay(100, time.Time{}, now); got != 30 {
+		t.Errorf("zero time: %d, want 30", got)
+	}
+	s := open(t)
+	if _, err := s.db.Exec(`INSERT INTO ip_scores (ip, score, updated_at) VALUES (?, ?, ?)`, "203.0.113.5", 100, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := score(t, s, "203.0.113.5"); got != 30 {
+		t.Errorf("legacy row: %d, want 30", got)
+	}
+}
+
+// Merged rows must not count towards the next comparison, and a real
+// shrink must win after a few snapshots.
+func TestRepeatedSmallSnapshotsEventuallyReplace(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	rows := func(n int) []nfg.Score {
+		var out []nfg.Score
+		for i := range n {
+			out = append(out, nfg.Score{IP: netip.AddrFrom4([4]byte{198, 51, byte(i >> 8), byte(i)}).String(), Score: 50, LastUpdated: now})
+		}
+		return out
+	}
+	if _, err := s.ReplaceAll(ctx, snapshot(rows(100)...)); err != nil {
+		t.Fatal(err)
+	}
+	for i := range maxMerges {
+		snap, err := s.ReplaceAll(ctx, snapshot(rows(40)...))
+		if err != nil || !snap.Merged {
+			t.Fatalf("small snapshot %d: %+v, %v", i, snap, err)
+		}
+	}
+	snap, err := s.ReplaceAll(ctx, snapshot(rows(40)...))
+	if err != nil || snap.Merged {
+		t.Fatalf("after %d merges: %+v, %v; want a replace", maxMerges, snap, err)
+	}
+	if score(t, s, "198.51.0.99") != 0 {
+		t.Fatal("rows gone from the backend must go once the shrink is accepted")
+	}
+	// 40 is the new baseline: 30 is no shrink worth merging.
+	if snap, err := s.ReplaceAll(ctx, snapshot(rows(30)...)); err != nil || snap.Merged {
+		t.Fatalf("%+v, %v", snap, err)
+	}
+}

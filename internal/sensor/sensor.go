@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,6 +31,11 @@ var (
 	retryMin               = 10 * time.Second
 	retryMax               = 5 * time.Minute
 	heartbeatEvery         = time.Minute
+	// rateLimitedRetry: a rate-limited sync is retried after 1-2x this.
+	rateLimitedRetry = time.Second
+	// syncedRecently: a websocket connect skips resources whose sync
+	// started this recently.
+	syncedRecently = 30 * time.Second
 )
 
 // Saved under these keys, the last rules received let the sensor work
@@ -67,6 +73,7 @@ type Sensor struct {
 	syslog  Component
 
 	refresh      map[string]chan struct{}
+	syncStarted  map[string]*atomic.Int64 // unix nanos of the last sync attempt
 	scoreUpdates chan nfg.ScoreUpdate
 	snapshotAt   atomic.Int64 // unix nanos of the last snapshot start
 	droppedFlows atomic.Uint64
@@ -83,6 +90,7 @@ func New(cfg config.Config, b Backend, store *scores.Store) *Sensor {
 		outbox:       NewOutbox(cfg.QueueSize),
 		flows:        make(chan flow.Flow, cfg.QueueSize),
 		refresh:      map[string]chan struct{}{},
+		syncStarted:  map[string]*atomic.Int64{},
 		scoreUpdates: make(chan nfg.ScoreUpdate, 4096),
 		sup:          NewSupervisor(),
 	}
@@ -91,6 +99,7 @@ func New(cfg config.Config, b Backend, store *scores.Store) *Sensor {
 	s.syslog = func(ctx context.Context, ready func()) error { return syslog.Run(ctx, cfg.SyslogAddr, s.Submit, ready) }
 	for _, r := range []string{stateConfig, stateBlocklists, stateWhitelist, "scores"} {
 		s.refresh[r] = make(chan struct{}, 1)
+		s.syncStarted[r] = new(atomic.Int64)
 	}
 	return s
 }
@@ -159,9 +168,26 @@ func (s *Sensor) keepFresh(ctx context.Context, name string, sync func(context.C
 		case <-t.C:
 		case <-s.refresh[name]:
 		}
+		// Recorded before the call: the first websocket connect usually
+		// lands while the startup sync is still in flight. A failed
+		// attempt is retried here anyway.
+		s.syncStarted[name].Store(time.Now().UnixNano())
 		if err := sync(ctx); err != nil {
 			if ctx.Err() != nil {
 				return
+			}
+			// score-proxy limits requests per second: a 429 clears within
+			// a second or two, so retry soon (jittered so the resources
+			// do not collide again) instead of backing off.
+			var rl *nfg.RateLimitedError
+			if errors.As(err, &rl) {
+				d := rl.RetryAfter
+				if d <= 0 {
+					d = rateLimitedRetry + rand.N(rateLimitedRetry)
+				}
+				zap.L().Info("sync rate limited", zap.String("resource", name), zap.Duration("retry_in", d))
+				t.Reset(d)
+				continue
 			}
 			zap.L().Warn("sync failed", zap.String("resource", name), zap.Error(err), zap.Duration("retry_in", wait))
 			t.Reset(wait)
@@ -286,10 +312,15 @@ func (s *Sensor) save(key string, v any) {
 }
 
 // onConnect resyncs what may have changed while the websocket was down.
+// A resource whose sync started moments ago is skipped: on startup
+// keepFresh is fetching everything already, and asking again would only
+// run into the backend's per-second rate limit.
 func (s *Sensor) onConnect() {
-	s.trigger(stateConfig)
-	s.trigger(stateBlocklists)
-	s.trigger(stateWhitelist)
+	for _, name := range []string{stateConfig, stateBlocklists, stateWhitelist} {
+		if time.Since(time.Unix(0, s.syncStarted[name].Load())) > syncedRecently {
+			s.trigger(name)
+		}
+	}
 	if time.Since(time.Unix(0, s.snapshotAt.Load())) > snapshotAfterReconnect {
 		s.trigger("scores")
 	}

@@ -36,6 +36,7 @@ type fakeBackend struct {
 	alerts   []nfg.Alert
 	recs     []nfg.Recommendation
 	beats    int
+	hits     map[string]int
 	wsConns  chan *websocket.Conn
 	upgrader websocket.Upgrader
 }
@@ -70,6 +71,10 @@ func (b *fakeBackend) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.hits == nil {
+		b.hits = map[string]int{}
+	}
+	b.hits[r.URL.Path]++
 	switch r.URL.Path {
 	case "/sync":
 		_, _ = io.WriteString(w, b.config)
@@ -326,4 +331,25 @@ func TestHeartbeatOnlyWhileComponentsRun(t *testing.T) {
 	}
 	_ = l.Close()
 	eventually(t, "heartbeat after syslog recovered", func() bool { _, _, beats := b.got(); return beats > 0 })
+}
+
+// The first websocket connect follows the initial sync within milliseconds;
+// fetching everything again would only hit score-proxy's per-second limit.
+func TestFirstConnectDoesNotRefetch(t *testing.T) {
+	b := newFakeBackend(t)
+	b.scores = []nfg.Score{{IP: "203.0.113.7", Score: 90, LastUpdated: time.Now()}}
+	startSensor(t, b, filepath.Join(t.TempDir(), "s.db"))
+	select {
+	case <-b.wsConns:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no websocket")
+	}
+	time.Sleep(200 * time.Millisecond)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, p := range []string{"/sync", "/sync/blocklist", "/sync/whitelist", "/sync/score"} {
+		if b.hits[p] != 1 {
+			t.Errorf("%s fetched %d times on startup, want 1", p, b.hits[p])
+		}
+	}
 }

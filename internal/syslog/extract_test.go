@@ -2,7 +2,9 @@ package syslog
 
 import (
 	"bufio"
+	"errors"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -56,4 +58,29 @@ func FuzzExtract(f *testing.F) {
 			t.Fatalf("ok with invalid address: %v %v", src, dst)
 		}
 	})
+}
+
+// A deeply nested 64 KiB JSON line must be cheap to reject: building every
+// parent path used to cost hundreds of MB per message.
+func TestDeepJSONIsBounded(t *testing.T) {
+	depth := 60 * 1024 / 6
+	msg := strings.Repeat(`{"a":`, depth) + `"1.2.3.4"` + strings.Repeat("}", depth)
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	before := m.TotalAlloc
+	if _, err := flattenJSON(msg); !errors.Is(err, errJSONTooDeep) {
+		t.Errorf("err = %v, want errJSONTooDeep", err)
+	}
+	runtime.ReadMemStats(&m)
+	if used := m.TotalAlloc - before; used > 1<<20 {
+		t.Errorf("rejecting deep JSON allocated %d KB", used>>10)
+	}
+	Extract(msg) // falls through to the free-text scan, which must cope
+	if _, err := flattenJSON(strings.Repeat(`{"a":`, maxJSONDepth+2) + `"x"` + strings.Repeat("}", maxJSONDepth+2)); !errors.Is(err, errJSONTooDeep) {
+		t.Errorf("err = %v, want errJSONTooDeep", err)
+	}
+	ok := strings.Repeat(`{"a":`, 5) + `{"src_ip":"203.0.113.1","dest_ip":"198.51.100.2"}` + strings.Repeat("}", 5)
+	if src, dst, found := Extract(ok); !found || src.String() != "203.0.113.1" || dst.String() != "198.51.100.2" {
+		t.Errorf("normal nesting broke: %v %v %v", src, dst, found)
+	}
 }

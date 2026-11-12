@@ -127,7 +127,12 @@ func streamURL(base, host string) (string, error) {
 		return "", fmt.Errorf("NFG_ARBITER_URL %q must use http or https", base)
 	}
 	if host != "" {
+		// As before: NFG_ARBITER_HOST names the websocket server on its own,
+		// so the REST URL's path prefix does not apply to it. The scheme
+		// still follows NFG_ARBITER_URL; main derived it from
+		// STREAMING_SKIP_VERIFY_TLS, which turned TLS off entirely.
 		u.Host = host
+		u.Path = ""
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + "/sync/ws/updates"
 	return u.String(), nil

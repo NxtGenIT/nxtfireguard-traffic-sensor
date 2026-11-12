@@ -16,7 +16,10 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Latest 1.26 patch: govulncheck flags the standard library of
+          # older patches, and go.mod only states the minimum.
+          go-version: '1.26.x'
+          check-latest: true
 
       - name: Install libpcap
         run: sudo apt-get update && sudo apt-get install -y libpcap-dev

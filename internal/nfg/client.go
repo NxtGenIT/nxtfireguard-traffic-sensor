@@ -186,9 +186,14 @@ func (c *Client) ScoreSnapshot(ctx context.Context, fn func(Score) error) error 
 
 func decodeScoreArray(r io.Reader, fn func(Score) error) error {
 	dec := json.NewDecoder(r)
-	if tok, err := dec.Token(); err != nil {
+	tok, err := dec.Token()
+	if err != nil {
 		return err
-	} else if d, ok := tok.(json.Delim); !ok || d != '[' {
+	}
+	if tok == nil {
+		return nil // `null`: how a Go backend marshals an empty (nil) slice
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '[' {
 		return fmt.Errorf("expected a JSON array, got %v", tok)
 	}
 	for dec.More() {
@@ -200,7 +205,7 @@ func decodeScoreArray(r io.Reader, fn func(Score) error) error {
 			return err
 		}
 	}
-	_, err := dec.Token()
+	_, err = dec.Token()
 	return err
 }
 

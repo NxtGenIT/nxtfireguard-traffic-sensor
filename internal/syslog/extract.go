@@ -163,13 +163,28 @@ func byKey(found []jsonAddr, key string) (netip.Addr, bool) {
 
 type jsonField struct{ path, value string }
 
+// Bounds for one JSON message. Real firewall and IDS events nest a few
+// levels and carry at most a few hundred strings; without a depth bound a
+// 64 KiB "{"a":{"a":..." line costs hundreds of MB in paths.
+const (
+	maxJSONDepth  = 32
+	maxJSONFields = 1024
+)
+
+var errJSONTooDeep = errors.New("JSON nested too deeply")
+
 // flattenJSON lists every string value with its dotted object path, in
-// document order (encoding/json maps would lose the order).
+// document order (encoding/json maps would lose the order). The path is
+// kept as a stack of keys and joined only for string values.
 func flattenJSON(msg string) ([]jsonField, error) {
 	dec := json.NewDecoder(strings.NewReader(msg))
 	var out []jsonField
-	var walk func(path string) error
-	walk = func(path string) error {
+	var path []string
+	var walk func(depth int) error
+	walk = func(depth int) error {
+		if depth > maxJSONDepth {
+			return errJSONTooDeep
+		}
 		tok, err := dec.Token()
 		if err != nil {
 			return err
@@ -184,17 +199,16 @@ func flattenJSON(msg string) ([]jsonField, error) {
 						return err
 					}
 					key, _ := k.(string)
-					child := key
-					if path != "" {
-						child = path + "." + key
-					}
-					if err := walk(child); err != nil {
+					path = append(path, key)
+					err = walk(depth + 1)
+					path = path[:len(path)-1]
+					if err != nil {
 						return err
 					}
 				}
 			case '[':
 				for dec.More() {
-					if err := walk(path); err != nil {
+					if err := walk(depth + 1); err != nil {
 						return err
 					}
 				}
@@ -202,11 +216,13 @@ func flattenJSON(msg string) ([]jsonField, error) {
 			_, err := dec.Token() // closing delimiter
 			return err
 		case string:
-			out = append(out, jsonField{path, t})
+			if len(out) < maxJSONFields {
+				out = append(out, jsonField{strings.Join(path, "."), t})
+			}
 		}
 		return nil
 	}
-	if err := walk(""); err != nil {
+	if err := walk(0); err != nil {
 		return nil, err
 	}
 	if _, err := dec.Token(); err != io.EOF {

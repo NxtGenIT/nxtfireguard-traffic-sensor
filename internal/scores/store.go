@@ -64,11 +64,24 @@ var ErrEmptySnapshot = errors.New("score snapshot is empty, keeping the current 
 // Snapshot is the outcome of ReplaceAll.
 type Snapshot struct {
 	Rows int // rows in the snapshot
-	// Merged is set when the snapshot had less than half the rows the
-	// sensor had. Then the old rows the snapshot lacks are kept instead of
-	// removed: a truncated snapshot must not silently unblock half the
-	// threats. Stale rows still decay, and the next full snapshot removes them.
+	// Merged is set when the snapshot had less than half the rows of the
+	// last snapshot that replaced the table. Then the old rows it lacks are
+	// kept instead of removed: a truncated download must not silently
+	// unblock half the threats. After maxMerges merges in a row the
+	// shrink is taken as real and the next snapshot replaces the table.
 	Merged bool
+}
+
+// maxMerges bounds how many small snapshots in a row are merged.
+const maxMerges = 3
+
+// baselineKey stores, in sensor_state, the size of the last snapshot that
+// replaced the table and how many merges followed it.
+const baselineKey = "score_snapshot"
+
+type baseline struct {
+	Rows   int `json:"rows"`
+	Merges int `json:"merges"`
 }
 
 func Open(path string, cacheSize int) (*Store, error) {
@@ -237,14 +250,34 @@ func (s *Store) swap(ctx context.Context, rows int) (merged bool, err error) {
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM ip_scores`).Scan(&have); err != nil {
 		return false, err
 	}
-	switch {
-	case rows == 0 && have > 0:
+	if rows == 0 && have > 0 {
 		return false, ErrEmptySnapshot
-	case rows < have/2:
+	}
+	// Compare with the last replacing snapshot, not with COUNT(*): merged
+	// rows must not make every later snapshot look small. Without a
+	// baseline (first run, or a volume from an earlier release that never
+	// removed rows) the snapshot replaces the table.
+	var base baseline
+	var raw string
+	switch err := tx.QueryRow(`SELECT value FROM sensor_state WHERE key = ?`, baselineKey).Scan(&raw); {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return false, err
+	default:
+		_ = json.Unmarshal([]byte(raw), &base) // unreadable: no baseline
+	}
+	if rows < base.Rows/2 && base.Merges < maxMerges {
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO ip_scores_next (ip, score, updated_at) SELECT ip, score, updated_at FROM ip_scores`); err != nil {
 			return false, err
 		}
 		merged = true
+		base.Merges++
+	} else {
+		base = baseline{Rows: rows}
+	}
+	b, _ := json.Marshal(base)
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO sensor_state (key, value) VALUES (?, ?)`, baselineKey, string(b)); err != nil {
+		return false, err
 	}
 
 	for ip := range s.live {
@@ -324,10 +357,12 @@ func Decay(score int32, updated, now time.Time) int32 {
 	if score == 0 {
 		return 0
 	}
-	age := now.Sub(updated)
-	if updated.IsZero() || age < 0 {
-		age = 0
+	// Earlier releases stored live updates without a time; those rows were
+	// served at the floor and still are. New rows always carry a time.
+	if updated.IsZero() || updated.Year() < 2000 {
+		return int32(math.Round(float64(score) * DecayFloor))
 	}
+	age := max(now.Sub(updated), 0) // clock skew must not inflate a score
 	m := math.Max(math.Pow(0.5, age.Hours()/DecayHalfLife.Hours()), DecayFloor)
 	return int32(math.Round(float64(score) * m))
 }

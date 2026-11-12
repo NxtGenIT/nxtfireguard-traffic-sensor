@@ -292,3 +292,13 @@ func TestScoreSnapshotStallIsAborted(t *testing.T) {
 		t.Fatalf("stall detected after %s", d)
 	}
 }
+
+func TestDecodeScoreArrayAcceptsNull(t *testing.T) {
+	n := 0
+	if err := decodeScoreArray(strings.NewReader("null"), func(Score) error { n++; return nil }); err != nil || n != 0 {
+		t.Fatalf("null: %v, %d rows", err, n)
+	}
+	if err := decodeScoreArray(strings.NewReader(`{"ip":"x"}`), func(Score) error { return nil }); err == nil {
+		t.Fatal("an object must be rejected")
+	}
+}

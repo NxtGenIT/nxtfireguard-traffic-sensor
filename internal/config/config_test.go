@@ -36,6 +36,9 @@ func TestStreamURL(t *testing.T) {
 		{"http://localhost:8080", "", "ws://localhost:8080/sync/ws/updates"},
 		{"https://arbiter.example/api/", "", "wss://arbiter.example/api/sync/ws/updates"},
 		{"https://arbiter.example", "stream.example:8443", "wss://stream.example:8443/sync/ws/updates"},
+		// An explicit host names the websocket server on its own, as before:
+		// the REST path prefix does not carry over.
+		{"https://gw.example/nfg", "arbiter.example", "wss://arbiter.example/sync/ws/updates"},
 	} {
 		vars := map[string]string{"NFG_ARBITER_URL": c.url, "NFG_ARBITER_HOST": c.host}
 		for k, v := range minimal {
