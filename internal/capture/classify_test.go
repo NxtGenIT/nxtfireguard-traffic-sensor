@@ -99,3 +99,19 @@ func TestEligible(t *testing.T) {
 		t.Error("interface without address")
 	}
 }
+
+func TestTableIsBounded(t *testing.T) {
+	old := maxTracked
+	maxTracked = 100
+	defer func() { maxTracked = old }()
+	c := NewClassifier()
+	for i := range 1000 {
+		p := build(t, pkt{src: "203.0.113.1", dst: "10.0.0.1", sport: uint16(i), dport: 53, proto: "udp"})
+		if _, _, isNew := c.Classify(p); !isNew {
+			t.Fatalf("packet %d not new", i)
+		}
+		if len(c.seen) > maxTracked {
+			t.Fatalf("table grew to %d", len(c.seen))
+		}
+	}
+}

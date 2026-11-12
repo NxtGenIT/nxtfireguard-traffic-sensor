@@ -213,13 +213,16 @@ func (s *Sensor) syncWhitelist(ctx context.Context) error {
 func (s *Sensor) syncScores(ctx context.Context) error {
 	s.snapshotAt.Store(time.Now().UnixNano())
 	start := time.Now()
-	n, err := s.store.ReplaceAll(ctx, func(add func(nfg.Score) error) error {
+	snap, err := s.store.ReplaceAll(ctx, func(add func(nfg.Score) error) error {
 		return s.backend.ScoreSnapshot(ctx, add)
 	})
 	if err != nil {
 		return err
 	}
-	zap.L().Info("score snapshot loaded", zap.Int("ips", n), zap.Duration("took", time.Since(start)))
+	if snap.Merged {
+		zap.L().Warn("score snapshot has less than half the known IPs, merged instead of replaced", zap.Int("ips", snap.Rows))
+	}
+	zap.L().Info("score snapshot loaded", zap.Int("ips", snap.Rows), zap.Duration("took", time.Since(start)))
 	return nil
 }
 

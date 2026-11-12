@@ -16,22 +16,39 @@ const (
 	kindRecommendation = "recommendation"
 )
 
-// Outbox delivers alerts and recommendations in the background. A message
-// that fails temporarily (network, 5xx, 429) is retried with backoff; a 429
-// also holds back every message of that kind until the backend accepts
-// them again. A message equal to one still waiting is dropped, and so is
-// everything once Capacity messages are waiting.
+var kinds = []string{kindAlert, kindRecommendation}
+
+// Outbox delivers alerts and recommendations in the background.
+//
+//   - Network errors and 5xx answers are retried with backoff, up to
+//     MaxAttempts; then giveUp runs so the caller may try again later.
+//   - A 429 holds back every message of that kind. score-proxy limits per
+//     second and sends no Retry-After, so without one the pause starts at
+//     MinPause and doubles while the backend keeps refusing (up to
+//     MaxPause). A 429 is not a failed attempt: the message waits, it is
+//     not dropped.
+//   - Any other 4xx means the backend will never take the message; it is
+//     dropped without giveUp, so the caller does not send it again.
+//
+// A message whose key is still waiting is dropped, and so is every new
+// message of a kind once Capacity messages of that kind are waiting. Each
+// kind has its own capacity so a flood of alerts cannot crowd out
+// recommendations (which are what actually block traffic).
 type Outbox struct {
-	Capacity    int
+	Capacity    int // per kind
 	MaxAttempts int
 	Backoff     time.Duration // first retry delay, doubled per attempt
 	MaxBackoff  time.Duration
+	MinPause    time.Duration // rate-limit pause without Retry-After
+	MaxPause    time.Duration
 	Tick        time.Duration // how often due retries are released
 
 	mu      sync.Mutex
 	pending map[string]*job
+	perKind map[string]int
 	delayed []*job
 	paused  map[string]time.Time
+	pause   map[string]time.Duration // current pause per kind, reset on success
 	ready   chan *job
 	now     func() time.Time
 
@@ -52,23 +69,31 @@ func NewOutbox(capacity int) *Outbox {
 		MaxAttempts: 10,
 		Backoff:     5 * time.Second,
 		MaxBackoff:  5 * time.Minute,
+		MinPause:    time.Second,
+		MaxPause:    30 * time.Second,
 		Tick:        time.Second,
 		pending:     map[string]*job{},
+		perKind:     map[string]int{},
 		paused:      map[string]time.Time{},
-		ready:       make(chan *job, capacity),
-		now:         time.Now,
+		pause:       map[string]time.Duration{},
+		// Every pending job is in ready, in delayed or being sent, so ready
+		// never holds more than all kinds' capacity together.
+		ready: make(chan *job, capacity*len(kinds)),
+		now:   time.Now,
 	}
 }
 
 // Add queues a message. giveUp, if set, runs when the message is dropped
-// without being delivered. It reports whether the message was queued.
+// for lack of room or after MaxAttempts. It reports whether the message
+// was queued.
 func (o *Outbox) Add(kind, key string, send func(context.Context) error, giveUp func()) bool {
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	if _, dup := o.pending[key]; dup {
+		o.mu.Unlock()
 		return false
 	}
-	if len(o.pending) >= o.Capacity {
+	if o.perKind[kind] >= o.Capacity {
+		o.mu.Unlock()
 		o.dropped.Add(1)
 		if giveUp != nil {
 			giveUp()
@@ -77,7 +102,9 @@ func (o *Outbox) Add(kind, key string, send func(context.Context) error, giveUp 
 	}
 	j := &job{kind: kind, key: key, send: send, giveUp: giveUp}
 	o.pending[key] = j
-	o.ready <- j // never blocks: ready holds at most len(pending) jobs
+	o.perKind[kind]++
+	o.ready <- j // never blocks, see NewOutbox
+	o.mu.Unlock()
 	return true
 }
 
@@ -86,9 +113,7 @@ func (o *Outbox) Add(kind, key string, send func(context.Context) error, giveUp 
 func (o *Outbox) Run(ctx context.Context, senders int) {
 	var wg sync.WaitGroup
 	for range senders {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				select {
 				case <-ctx.Done():
@@ -97,7 +122,7 @@ func (o *Outbox) Run(ctx context.Context, senders int) {
 					o.deliver(ctx, j)
 				}
 			}
-		}()
+		})
 	}
 
 	t := time.NewTicker(o.Tick)
@@ -118,11 +143,17 @@ func (o *Outbox) Run(ctx context.Context, senders int) {
 
 func (o *Outbox) deliver(ctx context.Context, j *job) {
 	if until, ok := o.pausedUntil(j.kind); ok {
-		o.retryAt(j, until, false)
+		o.delay(j, until)
 		return
 	}
 	err := j.send(ctx)
-	if err == nil || ctx.Err() != nil {
+	if ctx.Err() != nil {
+		return // shutting down; the message is lost either way
+	}
+	if err == nil {
+		o.mu.Lock()
+		delete(o.pause, j.kind)
+		o.mu.Unlock()
 		o.finish(j, false)
 		return
 	}
@@ -130,46 +161,59 @@ func (o *Outbox) deliver(ctx context.Context, j *job) {
 	var rl *nfg.RateLimitedError
 	switch {
 	case errors.As(err, &rl):
-		wait := rl.RetryAfter
-		if wait <= 0 {
-			wait = o.backoff(j.attempts + 1)
-		}
-		until := o.now().Add(wait)
-		o.mu.Lock()
-		if until.After(o.paused[j.kind]) {
-			o.paused[j.kind] = until
-		}
-		o.mu.Unlock()
-		zap.L().Info("backend rate limit, holding messages", zap.String("kind", j.kind), zap.Duration("for", wait))
-		o.retryAt(j, until, true)
+		until := o.holdKind(j.kind, rl.RetryAfter)
+		o.delay(j, until)
 	case nfg.Temporary(err):
-		o.retryAt(j, o.now().Add(o.backoff(j.attempts+1)), true)
-	default:
-		zap.L().Warn("message rejected by backend", zap.String("kind", j.kind), zap.Error(err))
-		o.finish(j, true)
-	}
-}
-
-func (o *Outbox) retryAt(j *job, due time.Time, attempted bool) {
-	if attempted {
 		j.attempts++
 		if j.attempts >= o.MaxAttempts {
-			zap.L().Warn("message dropped after retries", zap.String("kind", j.kind), zap.Int("attempts", j.attempts))
+			zap.L().Warn("message dropped after retries", zap.String("kind", j.kind), zap.Int("attempts", j.attempts), zap.Error(err))
 			o.finish(j, true)
 			return
 		}
+		o.delay(j, o.now().Add(o.backoff(j.attempts)))
+	default:
+		zap.L().Warn("message rejected by backend", zap.String("kind", j.kind), zap.Error(err))
+		o.finish(j, false)
 	}
+}
+
+// holdKind pauses kind after a 429 and returns when the pause ends.
+func (o *Outbox) holdKind(kind string, retryAfter time.Duration) time.Time {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	wait := retryAfter
+	if wait <= 0 {
+		wait = o.pause[kind]
+		if wait <= 0 {
+			wait = o.MinPause
+		} else {
+			wait = min(wait*2, o.MaxPause)
+		}
+		o.pause[kind] = wait
+	}
+	wait = min(wait, o.MaxBackoff)
+	until := o.now().Add(wait)
+	if until.After(o.paused[kind]) {
+		o.paused[kind] = until
+		zap.L().Info("backend rate limit, holding messages", zap.String("kind", kind), zap.Duration("for", wait))
+	}
+	return o.paused[kind]
+}
+
+func (o *Outbox) delay(j *job, due time.Time) {
 	j.due = due
 	o.mu.Lock()
 	o.delayed = append(o.delayed, j)
 	o.mu.Unlock()
 }
 
-func (o *Outbox) finish(j *job, failed bool) {
+// finish forgets j; giveUp runs if undelivered is set.
+func (o *Outbox) finish(j *job, undelivered bool) {
 	o.mu.Lock()
 	delete(o.pending, j.key)
+	o.perKind[j.kind]--
 	o.mu.Unlock()
-	if failed && j.giveUp != nil {
+	if undelivered && j.giveUp != nil {
 		j.giveUp()
 	}
 }

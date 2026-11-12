@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 FROM golang:1.26-bookworm AS builder
 
 # libpcap headers for gopacket/pcap (cgo); sqlite is compiled in by go-sqlite3.

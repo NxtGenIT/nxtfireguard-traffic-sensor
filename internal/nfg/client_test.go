@@ -84,13 +84,40 @@ func TestEmptyListsAreNotNil(t *testing.T) {
 	}
 }
 
-func TestRetriesServerErrors(t *testing.T) {
+func TestGetRetriesServerErrors(t *testing.T) {
 	var calls atomic.Int32
-	c := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if calls.Add(1) < 3 {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
+		_, _ = io.WriteString(w, `{"cidrs":["10.0.0.0/8"]}`)
+	}))
+	wl, err := c.Whitelist(context.Background())
+	if err != nil || len(wl) != 1 || calls.Load() != 3 {
+		t.Fatalf("%v, %v after %d calls", wl, err, calls.Load())
+	}
+}
+
+func TestGetGivesUpAfterRetries(t *testing.T) {
+	var calls atomic.Int32
+	c := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	_, err := c.SensorConfig(context.Background())
+	var se *StatusError
+	if !errors.As(err, &se) || se.Code != 503 || !Temporary(err) || calls.Load() != 1+int32(c.Retries) {
+		t.Fatalf("err %v, calls %d", err, calls.Load())
+	}
+}
+
+// POSTs are sent once: the outbox retries them with its own backoff, and
+// retrying here as well would multiply the load on a struggling backend.
+func TestPostIsSentOnce(t *testing.T) {
+	var calls atomic.Int32
+	c := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
 		body, _ := io.ReadAll(r.Body)
 		if string(body) != `{"ip":"1.2.3.4","decisions":[{"block":true,"reason":"r","blocklist":"b"}]}` {
 			t.Errorf("body %s", body)
@@ -98,23 +125,11 @@ func TestRetriesServerErrors(t *testing.T) {
 		if r.Header.Get("Content-Type") != "application/json" {
 			t.Errorf("content type %q", r.Header.Get("Content-Type"))
 		}
+		w.WriteHeader(http.StatusBadGateway)
 	}))
 	err := c.SendRecommendation(context.Background(), Recommendation{IP: "1.2.3.4", Decisions: []Decision{{Block: true, Reason: "r", Blocklist: "b"}}})
-	if err != nil || calls.Load() != 3 {
-		t.Fatalf("err %v after %d calls (body must be resent on retry)", err, calls.Load())
-	}
-}
-
-func TestGivesUpAfterRetries(t *testing.T) {
-	var calls atomic.Int32
-	c := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	err := c.SendAlert(context.Background(), Alert{})
-	var se *StatusError
-	if !errors.As(err, &se) || se.Code != 503 || !Temporary(err) || calls.Load() != 4 {
-		t.Fatalf("err %v, calls %d", err, calls.Load())
+	if !Temporary(err) || calls.Load() != 1 {
+		t.Fatalf("err %v after %d calls", err, calls.Load())
 	}
 }
 
@@ -252,5 +267,28 @@ func TestStreamReconnectsAndReportsEachConnect(t *testing.T) {
 	defer mu.Unlock()
 	if connects != 2 || len(scores) != 2 || scores[0] != 1 || scores[1] != 2 {
 		t.Fatalf("connects %d scores %v", connects, scores)
+	}
+}
+
+func TestScoreSnapshotStallIsAborted(t *testing.T) {
+	release := make(chan struct{})
+	c := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte{0x1f, 0x8b}) // start of a gzip stream, then nothing
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer close(release)
+	c.SnapshotIdle = 50 * time.Millisecond
+	start := time.Now()
+	err := c.ScoreSnapshot(context.Background(), func(Score) error { return nil })
+	if err == nil {
+		t.Fatal("a stalled snapshot must fail")
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("stall detected after %s", d)
 	}
 }

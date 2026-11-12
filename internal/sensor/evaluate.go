@@ -59,7 +59,14 @@ func (e *Evaluator) Evaluate(f flow.Flow) {
 
 // Forget lets the next connection of ip be recommended again, after its
 // score changed.
-func (e *Evaluator) Forget(ip string) { e.recommended.Remove(ip) }
+func (e *Evaluator) Forget(ip string) {
+	// Dedupe keys are canonical (see endpoint); score-updates may carry
+	// any spelling, e.g. "::ffff:1.2.3.4" or uppercase IPv6.
+	if a, err := netip.ParseAddr(ip); err == nil {
+		ip = a.Unmap().WithZone("").String()
+	}
+	e.recommended.Remove(ip)
+}
 
 // ForgetAll does Forget for every IP, after the blocklists changed.
 func (e *Evaluator) ForgetAll() { e.recommended.Purge() }

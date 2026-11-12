@@ -121,8 +121,8 @@ func TestReplaceAll(t *testing.T) {
 		}
 		return add(nfg.Score{IP: "203.0.113.4", Score: 44, LastUpdated: now})
 	})
-	if err != nil || n != 2 {
-		t.Fatalf("ReplaceAll = %d, %v", n, err)
+	if err != nil || n.Rows != 2 || n.Merged {
+		t.Fatalf("ReplaceAll = %+v, %v", n, err)
 	}
 	for ip, want := range map[string]int32{
 		"203.0.113.1": 99, // live update newer than snapshot row
@@ -157,8 +157,58 @@ func TestReplaceAllFailureKeepsTable(t *testing.T) {
 	if score(t, s, "203.0.113.1") != 80 || score(t, s, "198.51.0.1") != 0 {
 		t.Fatal("failed snapshot must leave the previous table untouched")
 	}
-	if _, err := s.ReplaceAll(ctx, snapshot()); err != nil {
+	if _, err := s.ReplaceAll(ctx, snapshot(nfg.Score{IP: "203.0.113.9", Score: 5, LastUpdated: now})); err != nil {
 		t.Fatalf("snapshot after a failed one: %v", err)
+	}
+}
+
+func TestEmptySnapshotKeepsTable(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	if snap, err := s.ReplaceAll(ctx, snapshot()); err != nil || snap.Rows != 0 {
+		t.Fatalf("empty snapshot into an empty table: %+v, %v", snap, err)
+	}
+	if _, err := s.ReplaceAll(ctx, snapshot(nfg.Score{IP: "203.0.113.1", Score: 80, LastUpdated: now})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReplaceAll(ctx, snapshot()); !errors.Is(err, ErrEmptySnapshot) {
+		t.Fatalf("err = %v, want ErrEmptySnapshot", err)
+	}
+	if score(t, s, "203.0.113.1") != 80 {
+		t.Fatal("empty snapshot must not wipe the scores")
+	}
+}
+
+func TestSmallSnapshotIsMerged(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	var full []nfg.Score
+	for i := range 10 {
+		full = append(full, nfg.Score{IP: netip.AddrFrom4([4]byte{198, 51, 100, byte(i)}).String(), Score: 50, LastUpdated: now})
+	}
+	if _, err := s.ReplaceAll(ctx, snapshot(full...)); err != nil {
+		t.Fatal(err)
+	}
+	// 4 of 10: probably truncated. Keep what the snapshot lacks, take what it has.
+	snap, err := s.ReplaceAll(ctx, snapshot(
+		nfg.Score{IP: "198.51.100.0", Score: 90, LastUpdated: now},
+		nfg.Score{IP: "198.51.100.1", Score: 90, LastUpdated: now},
+		nfg.Score{IP: "198.51.100.2", Score: 90, LastUpdated: now},
+		nfg.Score{IP: "203.0.113.7", Score: 90, LastUpdated: now},
+	))
+	if err != nil || !snap.Merged || snap.Rows != 4 {
+		t.Fatalf("ReplaceAll = %+v, %v", snap, err)
+	}
+	if score(t, s, "198.51.100.0") != 90 || score(t, s, "198.51.100.9") != 50 || score(t, s, "203.0.113.7") != 90 {
+		t.Fatal("merge must keep old rows and take the snapshot's")
+	}
+	// 6 of 11 is plausible: replace, the missing ones go.
+	snap, err = s.ReplaceAll(ctx, snapshot(full[:6]...))
+	if err != nil || snap.Merged {
+		t.Fatalf("ReplaceAll = %+v, %v", snap, err)
+	}
+	if score(t, s, "198.51.100.9") != 0 {
+		t.Fatal("a plausible snapshot replaces the table")
 	}
 }
 

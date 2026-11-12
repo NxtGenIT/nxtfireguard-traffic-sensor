@@ -23,6 +23,9 @@ var (
 	stableConn   = time.Minute
 )
 
+// maxMessage bounds one websocket message; updates are a few hundred bytes.
+const maxMessage = 1 << 20
+
 // Stream keeps the update websocket open until ctx ends, reconnecting with
 // backoff. connected runs after every successful (re)connect, before the
 // first message is read, so the caller can resync whatever it missed while
@@ -78,6 +81,7 @@ func readUntilClosed(ctx context.Context, conn *websocket.Conn, handle func(Upda
 		wg.Wait()
 	}()
 
+	conn.SetReadLimit(maxMessage)
 	_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(readTimeout))

@@ -114,3 +114,62 @@ func TestServerReportsBindFailure(t *testing.T) {
 		t.Fatal("no error for a bound port")
 	}
 }
+
+func TestHostileInputDoesNotPanic(t *testing.T) {
+	for _, in := range []string{"<0>", "-5 x", "-1 x", "9223372036854775807 x", "<999999999999>1", "<1>1 - - - - - -", "\x00\x00"} {
+		if msg := datagram([]byte(in)); len(msg) > 0 {
+			_, _ = content(msg)
+		}
+		_, _, _ = splitTCP([]byte(in), true)
+		_, _, _ = splitTCP([]byte(in), false)
+	}
+}
+
+func TestSplitTCP(t *testing.T) {
+	cases := []struct {
+		in    string
+		atEOF bool
+		adv   int
+		tok   string
+		err   bool
+	}{
+		{"5 hello6 world!", false, 7, "hello", false},
+		{"12 short", false, 0, "", false}, // wait for the rest
+		{"12 short", true, 8, "short", false},
+		{"0 x", false, 0, "", true},
+		{"99999999 x", false, 0, "", false}, // seven digits: not a header, a line
+		{"line one\\nline two", false, 0, "", false},
+		{"line one\nline two", false, 9, "line one", false},
+		{"123", false, 0, "", false}, // maybe a header
+	}
+	for _, c := range cases {
+		adv, tok, err := splitTCP([]byte(c.in), c.atEOF)
+		if adv != c.adv || string(tok) != c.tok || (err != nil) != c.err {
+			t.Errorf("splitTCP(%q, %v) = %d %q %v", c.in, c.atEOF, adv, tok, err)
+		}
+	}
+}
+
+func FuzzReceive(f *testing.F) {
+	for _, s := range []string{"<0>", "-1 x", "<134>Jan  1 00:00:00 h t: from 1.2.3.4 to 5.6.7.8", "<134>1 2026-01-01T00:00:00Z h a - - - m"} {
+		f.Add([]byte(s))
+	}
+	f.Fuzz(func(t *testing.T, b []byte) {
+		if msg := datagram(b); len(msg) > 0 {
+			if m, ok := content(msg); ok {
+				_, _, _ = Extract(m)
+			}
+		}
+		data := b
+		for range 100 {
+			adv, tok, err := splitTCP(data, true)
+			if err != nil || adv == 0 {
+				break
+			}
+			if adv > len(data) || len(tok) > adv {
+				t.Fatalf("bad split %d %d of %d", adv, len(tok), len(data))
+			}
+			data = data[adv:]
+		}
+	})
+}

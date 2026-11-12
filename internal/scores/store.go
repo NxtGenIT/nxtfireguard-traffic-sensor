@@ -48,15 +48,37 @@ type Store struct {
 	live map[string]struct{}
 
 	// gen changes on every write, so a lookup that raced with a write does
-	// not put the stale row it read back into the cache.
-	gen atomic.Uint64
+	// not put the stale row it read back into the cache. cacheMu makes
+	// "gen unchanged, so add" and "bump gen, then evict" atomic with each
+	// other; without it a lookup could check gen, lose the CPU to a write
+	// that bumps gen and evicts, and then add its stale row.
+	gen     atomic.Uint64
+	cacheMu sync.Mutex
+}
+
+// ErrEmptySnapshot is returned when the backend sends no scores while the
+// sensor has some. That is a backend fault (an empty cache, a license
+// mix-up), and keeping the old scores is safer than blocking nothing.
+var ErrEmptySnapshot = errors.New("score snapshot is empty, keeping the current scores")
+
+// Snapshot is the outcome of ReplaceAll.
+type Snapshot struct {
+	Rows int // rows in the snapshot
+	// Merged is set when the snapshot had less than half the rows the
+	// sensor had. Then the old rows the snapshot lacks are kept instead of
+	// removed: a truncated snapshot must not silently unblock half the
+	// threats. Stale rows still decay, and the next full snapshot removes them.
+	Merged bool
 }
 
 func Open(path string, cacheSize int) (*Store, error) {
-	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=10000&_synchronous=NORMAL")
+	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=10000&_synchronous=NORMAL&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
+	// _txlock=immediate: write transactions take the write lock at BEGIN,
+	// so two of them wait on busy_timeout instead of one failing with
+	// "database is locked" when it upgrades from read to write.
 	db.SetMaxOpenConns(4)
 	// ip_scores keeps the schema of earlier releases so existing volumes
 	// load without migration.
@@ -101,9 +123,11 @@ func (s *Store) Score(ip netip.Addr) (int32, error) {
 			c = cached{score: int32(score.Int64), updated: updated.Time}
 		}
 		// Unknown IPs are cached too: most traffic has no score.
+		s.cacheMu.Lock()
 		if s.gen.Load() == gen {
 			s.cache.Add(key, c)
 		}
+		s.cacheMu.Unlock()
 	}
 	return Decay(c.score, c.updated, s.now()), nil
 }
@@ -119,16 +143,16 @@ func (s *Store) Put(sc nfg.Score) error {
 	if s.live != nil {
 		s.live[key] = struct{}{}
 	}
-	s.gen.Add(1)
-	s.cache.Remove(key)
+	s.invalidate(func() { s.cache.Remove(key) })
 	return nil
 }
 
 // ReplaceAll swaps the whole table for a snapshot. fill streams the snapshot
 // into add. Rows Put while the snapshot loads stay if they are newer than
-// the snapshot's row. IPs missing from the snapshot are removed. If fill
-// fails, the current table is kept.
-func (s *Store) ReplaceAll(ctx context.Context, fill func(add func(nfg.Score) error) error) (int, error) {
+// the snapshot's row. IPs missing from the snapshot are removed, unless the
+// snapshot is suspiciously small (see Snapshot.Merged). If fill fails or
+// the snapshot is empty, the current table is kept.
+func (s *Store) ReplaceAll(ctx context.Context, fill func(add func(nfg.Score) error) error) (Snapshot, error) {
 	s.mu.Lock()
 	s.live = map[string]struct{}{}
 	s.mu.Unlock()
@@ -139,17 +163,19 @@ func (s *Store) ReplaceAll(ctx context.Context, fill func(add func(nfg.Score) er
 	}()
 
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE ip_scores_next (ip TEXT PRIMARY KEY, score INTEGER, updated_at DATETIME)`); err != nil {
-		return 0, err
+		return Snapshot{}, err
 	}
-	n, err := s.loadNext(ctx, fill)
+	snap := Snapshot{}
+	var err error
+	snap.Rows, err = s.loadNext(ctx, fill)
 	if err == nil {
-		err = s.swap(ctx)
+		snap.Merged, err = s.swap(ctx, snap.Rows)
 	}
 	if err != nil {
 		_, _ = s.db.Exec(`DROP TABLE IF EXISTS ip_scores_next`)
-		return 0, err
+		return Snapshot{}, err
 	}
-	return n, nil
+	return snap, nil
 }
 
 // loadNext buffers rows and writes each full chunk in its own short
@@ -198,42 +224,62 @@ func (s *Store) loadNext(ctx context.Context, fill func(add func(nfg.Score) erro
 	return n, err
 }
 
-func (s *Store) swap(ctx context.Context) error {
+func (s *Store) swap(ctx context.Context, rows int) (merged bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after commit
+
+	var have int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM ip_scores`).Scan(&have); err != nil {
+		return false, err
+	}
+	switch {
+	case rows == 0 && have > 0:
+		return false, ErrEmptySnapshot
+	case rows < have/2:
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO ip_scores_next (ip, score, updated_at) SELECT ip, score, updated_at FROM ip_scores`); err != nil {
+			return false, err
+		}
+		merged = true
+	}
 
 	for ip := range s.live {
 		var score int64
 		var updated time.Time
 		if err := tx.QueryRow(`SELECT score, updated_at FROM ip_scores WHERE ip = ?`, ip).Scan(&score, &updated); err != nil {
-			return err
+			return false, err
 		}
 		var snapUpdated sql.NullTime
 		err := tx.QueryRow(`SELECT updated_at FROM ip_scores_next WHERE ip = ?`, ip).Scan(&snapUpdated)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
+			return false, err
 		}
 		if snapUpdated.Valid && snapUpdated.Time.After(updated) {
 			continue
 		}
 		if _, err := tx.Exec(`INSERT OR REPLACE INTO ip_scores_next (ip, score, updated_at) VALUES (?, ?, ?)`, ip, score, updated); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if _, err := tx.Exec(`DROP TABLE ip_scores; ALTER TABLE ip_scores_next RENAME TO ip_scores`); err != nil {
-		return err
+		return false, err
 	}
 	if err := tx.Commit(); err != nil {
-		return err
+		return false, err
 	}
+	s.invalidate(s.cache.Purge)
+	return merged, nil
+}
+
+func (s *Store) invalidate(evict func()) {
+	s.cacheMu.Lock()
 	s.gen.Add(1)
-	s.cache.Purge()
-	return nil
+	evict()
+	s.cacheMu.Unlock()
 }
 
 // normalize keys rows by the canonical text form of the address, which is

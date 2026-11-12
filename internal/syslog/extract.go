@@ -108,7 +108,8 @@ func filterlog(msg string) (netip.Addr, netip.Addr, bool) {
 }
 
 // jsonPairs are source/destination field paths, most specific first:
-// Suricata EVE, common variants, Elastic Common Schema, Azure/Sentinel.
+// Suricata EVE, common variants, Elastic Common Schema, CEF full names,
+// AWS VPC flow logs.
 var jsonPairs = [][2]string{
 	{"src_ip", "dest_ip"},
 	{"src_ip", "dst_ip"},

@@ -29,15 +29,22 @@ type Client struct {
 	secret       config.Secret
 	userAgent    string
 
-	http   *http.Client
-	dialer *websocket.Dialer
+	http     *http.Client
+	snapshot *http.Client
+	dialer   *websocket.Dialer
 
-	// Retries is how often a request is repeated after a network error or a
-	// 5xx answer, waiting Backoff, 2*Backoff, ... in between.
+	// Retries is how often a GET is repeated after a network error or a 5xx
+	// answer, waiting Backoff, 2*Backoff, ... in between. POSTs are not
+	// repeated here; the caller's outbox retries them.
 	Retries int
 	Backoff time.Duration
 	// Requests without their own deadline get this one.
 	Timeout time.Duration
+	// score-proxy builds the snapshot before it answers, which can take
+	// minutes on a cache miss. SnapshotTimeout bounds the whole download,
+	// SnapshotIdle a stall in the middle of it.
+	SnapshotTimeout time.Duration
+	SnapshotIdle    time.Duration
 }
 
 func New(cfg config.Config, version string) *Client {
@@ -55,6 +62,8 @@ func New(cfg config.Config, version string) *Client {
 		MaxIdleConnsPerHost:   8,
 		ForceAttemptHTTP2:     true,
 	}
+	slow := transport.Clone()
+	slow.ResponseHeaderTimeout = 0
 	return &Client{
 		baseURL:      cfg.ArbiterURL,
 		streamURL:    cfg.StreamURL,
@@ -64,14 +73,17 @@ func New(cfg config.Config, version string) *Client {
 		secret:       cfg.AuthSecret,
 		userAgent:    "nfg-traffic-sensor/" + version,
 		http:         &http.Client{Transport: transport},
+		snapshot:     &http.Client{Transport: slow},
 		dialer: &websocket.Dialer{
 			Proxy:            http.ProxyFromEnvironment,
 			HandshakeTimeout: 15 * time.Second,
 			TLSClientConfig:  tlsConf,
 		},
-		Retries: 3,
-		Backoff: time.Second,
-		Timeout: 30 * time.Second,
+		Retries:         3,
+		Backoff:         time.Second,
+		Timeout:         30 * time.Second,
+		SnapshotTimeout: 30 * time.Minute,
+		SnapshotIdle:    5 * time.Minute,
 	}
 }
 
@@ -137,13 +149,20 @@ func (c *Client) Whitelist(ctx context.Context) ([]string, error) {
 // ScoreSnapshot streams GET /sync/score, a tar.gz of JSON arrays of Score,
 // into fn. The snapshot holds every scored IP the license can see.
 func (c *Client) ScoreSnapshot(ctx context.Context, fn func(Score) error) error {
-	resp, err := c.do(ctx, http.MethodGet, c.baseURL+"/sync/score", nil, c.sensorHeaders)
+	ctx, cancel := context.WithTimeout(ctx, c.SnapshotTimeout)
+	defer cancel()
+	// Not retried here: a retry would make score-proxy build it again.
+	resp, err := c.send(ctx, c.snapshot, http.MethodGet, c.baseURL+"/sync/score", nil, c.sensorHeaders, 0)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close() //nolint:errcheck // read-only body
 
-	gz, err := gzip.NewReader(resp.Body)
+	stall := time.AfterFunc(c.SnapshotIdle, cancel)
+	defer stall.Stop()
+	body := &idleReader{r: resp.Body, timer: stall, idle: c.SnapshotIdle}
+
+	gz, err := gzip.NewReader(body)
 	if err != nil {
 		return fmt.Errorf("score snapshot: %w", err)
 	}
@@ -198,9 +217,11 @@ func (c *Client) Heartbeat(ctx context.Context) error {
 	if c.heartbeatID == "" {
 		return nil
 	}
-	resp, err := c.do(ctx, http.MethodGet, c.heartbeatURL+"/ping/"+c.heartbeatID, nil, func(r *http.Request) {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
+	resp, err := c.send(ctx, c.http, http.MethodGet, c.heartbeatURL+"/ping/"+c.heartbeatID, nil, func(r *http.Request) {
 		r.Header.Set("apikey", c.secret.Reveal())
-	})
+	}, 1)
 	if err != nil {
 		return err
 	}
@@ -215,7 +236,7 @@ func (c *Client) sensorHeaders(r *http.Request) {
 func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	ctx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	resp, err := c.do(ctx, http.MethodGet, c.baseURL+path, nil, c.sensorHeaders)
+	resp, err := c.send(ctx, c.http, http.MethodGet, c.baseURL+path, nil, c.sensorHeaders, c.Retries)
 	if err != nil {
 		return err
 	}
@@ -233,10 +254,10 @@ func (c *Client) postJSON(ctx context.Context, path string, in any) error {
 	}
 	ctx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	resp, err := c.do(ctx, http.MethodPost, c.baseURL+path, body, func(r *http.Request) {
+	resp, err := c.send(ctx, c.http, http.MethodPost, c.baseURL+path, body, func(r *http.Request) {
 		c.sensorHeaders(r)
 		r.Header.Set("Content-Type", "application/json")
-	})
+	}, 0)
 	if err != nil {
 		return err
 	}
@@ -250,14 +271,15 @@ func (c *Client) withTimeout(ctx context.Context) (context.Context, context.Canc
 	return context.WithTimeout(ctx, c.Timeout)
 }
 
-// do sends the request, repeating it after network errors and 5xx answers.
-// It returns the response only for 2xx; the caller closes its body.
-func (c *Client) do(ctx context.Context, method, url string, body []byte, headers func(*http.Request)) (*http.Response, error) {
+// send sends the request, repeating it up to retries times after network
+// errors and 5xx answers. It returns the response only for 2xx; the caller
+// closes its body.
+func (c *Client) send(ctx context.Context, hc *http.Client, method, url string, body []byte, headers func(*http.Request), retries int) (*http.Response, error) {
 	wait := c.Backoff
 	var lastErr error
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
-			if attempt > c.Retries {
+			if attempt > retries {
 				return nil, lastErr
 			}
 			if err := sleep(ctx, wait); err != nil {
@@ -273,7 +295,7 @@ func (c *Client) do(ctx context.Context, method, url string, body []byte, header
 		req.Header.Set("User-Agent", c.userAgent)
 		headers(req)
 
-		resp, err := c.http.Do(req)
+		resp, err := hc.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -298,6 +320,20 @@ func (c *Client) do(ctx context.Context, method, url string, body []byte, header
 	}
 }
 
+// idleReader restarts timer on every read, so the timer only fires when
+// the body stalls for idle.
+type idleReader struct {
+	r     io.Reader
+	timer *time.Timer
+	idle  time.Duration
+}
+
+func (i *idleReader) Read(p []byte) (int, error) {
+	n, err := i.r.Read(p)
+	i.timer.Reset(i.idle)
+	return n, err
+}
+
 func drain(resp *http.Response) error {
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	return resp.Body.Close()
@@ -309,7 +345,7 @@ func retryAfter(v string) time.Duration {
 		return 0
 	}
 	if s, err := strconv.Atoi(v); err == nil && s > 0 {
-		return time.Duration(s) * time.Second
+		return time.Duration(min(s, 86400)) * time.Second
 	}
 	if t, err := http.ParseTime(v); err == nil {
 		if d := time.Until(t); d > 0 {

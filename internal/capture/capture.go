@@ -53,9 +53,6 @@ func Run(ctx context.Context, emit func(flow.Flow), ready func()) error {
 			zap.L().Warn("capture: cannot open interface", zap.String("interface", d.Name), zap.Error(err))
 			continue
 		}
-		if err := h.SetBPFFilter("ip or ip6"); err != nil {
-			zap.L().Warn("capture: no BPF filter", zap.String("interface", d.Name), zap.Error(err))
-		}
 		handles = append(handles, h)
 		names = append(names, d.Name)
 	}

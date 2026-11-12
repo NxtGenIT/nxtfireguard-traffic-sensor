@@ -13,6 +13,11 @@ import (
 // trackTTL is how long a connection counts as seen after its last packet.
 const trackTTL = 2 * time.Minute
 
+// maxTracked bounds the connection table (about 100 bytes per entry), so a
+// flood of spoofed sources or a port scan cannot exhaust memory. When it is
+// full, the table starts over: some connections are then evaluated twice.
+var maxTracked = 1 << 19
+
 // Classifier decides which packets start a connection worth evaluating.
 // A TCP SYN without ACK always does. Any other packet does if its
 // connection (in either direction) was not seen within trackTTL, which
@@ -78,6 +83,10 @@ func (c *Classifier) markSeen(proto uint8, a, b netip.Addr, pa, pb uint16) bool 
 		c.lastSweep = now
 	}
 	last, ok := c.seen[k]
+	if !ok && len(c.seen) >= maxTracked {
+		clear(c.seen)
+		c.lastSweep = now
+	}
 	c.seen[k] = now
 	return !ok || now.Sub(last) > trackTTL
 }

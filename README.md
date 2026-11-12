@@ -35,7 +35,7 @@ SYSLOG_PORT=
 | `SQLITE_DB_PATH` | `/data/ip_scores.db` | Local score database and last known settings |
 | `DEBUG` | `false` | Debug logging |
 | `NFG_ARBITER_URL` | `https://arbiter.nxtfireguard.de` | Backend URL; the update websocket is derived from it |
-| `NFG_ARBITER_HOST` | empty | Websocket host, only if it differs from `NFG_ARBITER_URL` |
+| `NFG_ARBITER_HOST` | empty | Websocket host (`host` or `host:port`), only if it differs from `NFG_ARBITER_URL`. The scheme still follows `NFG_ARBITER_URL`: `https` gives `wss`, `http` gives `ws` |
 | `STREAMING_SKIP_VERIFY_TLS` | `false` | Skip TLS certificate checks (test backends only) |
 | `EVALUATION_WORKERS` / `EVALUATION_QUEUE_SIZE` | `8` / `4096` | Parallel evaluations and connections waiting for one |
 
@@ -75,7 +75,8 @@ volumes:
 - **Traffic capture** listens on every interface with an address, except loopback and Docker bridges. Each new connection (TCP SYN, or the first packet of a flow within two minutes) is evaluated once.
 - **Syslog** accepts RFC 3164 and RFC 5424 messages over UDP and TCP. Source and destination are read from CEF/key-value fields (`src=`, `dst=`, `srcip=`, `dstip=`), Cisco `a(port) -> b(port)` logs, pfSense/OPNsense filterlog (IPv4 and IPv6), and JSON fields such as Suricata EVE `src_ip`/`dest_ip` or ECS `source.ip`/`destination.ip`. Otherwise the first two addresses in the message are used.
 - Both ends of a connection are checked. A connection with a whitelisted end is ignored. Loopback, multicast, broadcast and link-local addresses are not checked (169.254.169.254 is).
-- An **alert** is sent when an IP's score reaches the alert threshold. A **recommendation** is sent for an IP again only when its score or its matching blocklists change. If the backend is busy (HTTP 429) or unreachable, both are retried with backoff.
+- An **alert** is sent when an IP's score reaches the alert threshold. A **recommendation** is sent for an IP again only when its score or its matching blocklists change. If the backend is unreachable or answers 5xx, they are retried with backoff (up to 10 attempts). If it rate-limits (HTTP 429), that kind of message is held back and the pause grows from 1s to 30s until the backend accepts again; nothing is dropped for that. A message the backend rejects with another 4xx is dropped and logged. Alerts and recommendations queue separately (`EVALUATION_QUEUE_SIZE` each), so an alert flood never delays blocking.
+- An empty score snapshot never wipes the local scores, and a snapshot with less than half the known IPs is merged instead of replacing them.
 - The last settings received from the backend are stored, so the sensor keeps working if the backend is unreachable when it starts.
 - A **heartbeat** is sent every minute while every enabled part (capture, syslog) is running.
 
