@@ -149,6 +149,7 @@ type syslogCase struct {
 	msg      string
 	src, dst netip.Addr
 	flow     bool
+	want     []string // alert keys, see alertKeys
 }
 
 func readCorpus(t *testing.T) []syslogCase {
@@ -213,16 +214,20 @@ func alertKeys(alerts []alert) []string {
 }
 
 // 3: syslog lines of every supported format, over UDP and TCP, become alerts.
+// Each corpus line is checked on its own: several lines name the same
+// addresses, so a combined check would let one line cover for another.
 func TestSyslog(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	cases := readCorpus(t)
 
 	// Every scorable address of the corpus scores above the alert threshold.
-	var want []alert
 	scored := map[string]bool{}
+	var flows, noFlows []syslogCase
+	total := 0
 	for _, c := range cases {
 		if !c.flow {
+			noFlows = append(noFlows, c)
 			continue
 		}
 		ends := []struct {
@@ -232,6 +237,7 @@ func TestSyslog(t *testing.T) {
 		if c.src == c.dst {
 			ends = ends[:1]
 		}
+		var want []alert
 		for _, end := range ends {
 			if !scorable(end.ip) {
 				continue
@@ -239,7 +245,15 @@ func TestSyslog(t *testing.T) {
 			scored[end.ip.String()] = true
 			want = append(want, alert{IPType: end.role, IP: end.ip.String(), RelatedIP: end.other.String(), SourceType: "syslog", SourceName: e.ip(1)})
 		}
+		c.want = alertKeys(want)
+		total += len(c.want)
+		flows = append(flows, c)
 	}
+	if len(flows) < 15 || len(noFlows) < 3 || total < 30 {
+		t.Fatalf("corpus too small: %d lines with a flow (%d alerts), %d without", len(flows), total, len(noFlows))
+	}
+	t.Logf("%d corpus lines with a flow (%d alerts), %d without", len(flows), total, len(noFlows))
+
 	e.backend.set(func(b *backend) {
 		b.config = sensorConfig{SniffTraffic: false, RunSyslog: true, AlertThreshold: alertThreshold}
 		b.blocklists = []blocklist{}
@@ -255,60 +269,87 @@ func TestSyslog(t *testing.T) {
 		t.Error("capture started although the backend turned it off")
 	}
 	addr := net.JoinHostPort(e.sensorIP(), fmt.Sprint(syslogPort))
-	wantKeys := alertKeys(want)
-	if len(wantKeys) < 25 {
-		t.Fatalf("only %d expected alerts from the corpus", len(wantKeys))
-	}
-	t.Logf("%d corpus lines, %d distinct alerts expected per transport", len(cases), len(wantKeys))
 
-	check := func(transport string) {
-		t.Helper()
-		got := alertKeys(e.backend.allAlerts())
-		if !slices.Equal(got, wantKeys) {
-			t.Errorf("%s: alerts differ\n got: %s\nwant: %s", transport, strings.Join(got, "\n      "), strings.Join(wantKeys, "\n      "))
-		}
-	}
-
-	// UDP, RFC 3164. Datagrams can be lost, so resend until all arrived.
-	retrying(t, time.Minute, 5*time.Second, "alerts for every UDP syslog line", func() {
-		conn, err := net.Dial("udp", addr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = conn.Close() }()
-		for _, c := range cases {
-			line := fmt.Sprintf("<134>%s fw01 nfgtest[42]: %s", time.Now().Format(time.Stamp), c.msg)
-			if _, err := conn.Write([]byte(line)); err != nil {
-				t.Fatal(err)
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-	}, func() bool { return len(alertKeys(e.backend.allAlerts())) >= len(wantKeys) })
-	time.Sleep(2 * time.Second)
-	check("udp")
-
-	// TCP, RFC 5424, alternating octet-counted and newline framing.
-	e.backend.forget()
-	conn, err := net.Dial("tcp", addr)
+	tcp, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i, c := range cases {
-		msg := fmt.Sprintf("<134>1 %s fw01 nfgtest 42 - - %s", time.Now().UTC().Format(time.RFC3339), c.msg)
-		frame := msg + "\n"
-		if i%2 == 0 {
-			frame = fmt.Sprintf("%d %s", len(msg), msg)
+	defer func() { _ = tcp.Close() }()
+	udp, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = udp.Close() }()
+	frames := 0
+	transports := []struct {
+		name string
+		send func(msg string)
+		// resend: datagrams can be lost; a TCP line arrives or the test fails.
+		resend time.Duration
+	}{
+		{"udp/rfc3164", func(msg string) {
+			line := fmt.Sprintf("<134>%s fw01 nfgtest[42]: %s", time.Now().Format(time.Stamp), msg)
+			if _, err := udp.Write([]byte(line)); err != nil {
+				t.Fatal(err)
+			}
+		}, 3 * time.Second},
+		{"tcp/rfc5424", func(msg string) {
+			// Alternating octet-counted and newline framing on one connection.
+			line := fmt.Sprintf("<134>1 %s fw01 nfgtest 42 - - %s", time.Now().UTC().Format(time.RFC3339), msg)
+			frame := line + "\n"
+			if frames++; frames%2 == 0 {
+				frame = fmt.Sprintf("%d %s", len(line), line)
+			}
+			if _, err := tcp.Write([]byte(frame)); err != nil {
+				t.Fatal(err)
+			}
+		}, 30 * time.Second},
+	}
+
+	for _, tr := range transports {
+		var prev []string
+		for _, c := range flows {
+			e.backend.forget()
+			retrying(t, 30*time.Second, tr.resend, fmt.Sprintf("%s: alerts %v for %q", tr.name, c.want, c.msg),
+				func() { tr.send(c.msg) },
+				func() bool { return subset(c.want, alertKeys(e.backend.allAlerts())) })
+			time.Sleep(200 * time.Millisecond)
+			// A late duplicate of the previous line is the only other thing
+			// that may arrive.
+			allowed := append(slices.Clone(c.want), prev...)
+			if got := alertKeys(e.backend.allAlerts()); !subset(got, allowed) {
+				t.Errorf("%s: %q gave alerts %v, want %v", tr.name, c.msg, got, c.want)
+			}
+			prev = c.want
 		}
-		if _, err := conn.Write([]byte(frame)); err != nil {
-			t.Fatal(err)
+
+		// Lines without a usable address pair give nothing. The first flow
+		// line goes last, as a marker that the others were processed.
+		e.backend.forget()
+		marker := flows[0]
+		retrying(t, 30*time.Second, tr.resend, tr.name+": marker after the lines without a flow",
+			func() {
+				for _, c := range noFlows {
+					tr.send(c.msg)
+				}
+				tr.send(marker.msg)
+			},
+			func() bool { return subset(marker.want, alertKeys(e.backend.allAlerts())) })
+		time.Sleep(time.Second)
+		if got := alertKeys(e.backend.allAlerts()); !subset(got, marker.want) {
+			t.Errorf("%s: lines without a flow gave alerts: %v", tr.name, got)
 		}
 	}
-	_ = conn.Close()
-	eventually(t, 30*time.Second, "alerts for every TCP syslog line", func() bool {
-		return len(alertKeys(e.backend.allAlerts())) >= len(wantKeys)
-	})
-	time.Sleep(2 * time.Second)
-	check("tcp")
+}
+
+// subset reports whether every element of a is in b.
+func subset(a, b []string) bool {
+	for _, x := range a {
+		if !slices.Contains(b, x) {
+			return false
+		}
+	}
+	return true
 }
 
 // 4: websocket pushes are applied, and changed decisions are recommended.

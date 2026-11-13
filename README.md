@@ -110,8 +110,8 @@ network's gateway address, which is the host only with native Docker (not
 Docker Desktop or colima on macOS, where CI is the way to run them):
 
 ```bash
-go test -tags e2e -v -timeout 20m ./e2e/                  # builds the image first
-E2E_IMAGE=traffic-sensor go test -tags e2e -v ./e2e/      # or test a built image
+go test -tags e2e -count=1 -v -timeout 20m ./e2e/                  # builds the image first
+E2E_IMAGE=traffic-sensor go test -tags e2e -count=1 -v ./e2e/      # or test a built image
 ```
 
 CI runs them on every pull request and nightly. Covered:
@@ -120,7 +120,7 @@ CI runs them on every pull request and nightly. Covered:
 |------|-----------|
 | `TestStartupWaitsForScores` | no capture and no heartbeat until rules and scores are loaded |
 | `TestCapturedTraffic` | a captured connection gives the right alert and recommendation; whitelisted and low scores give none; repeats are deduplicated |
-| `TestSyslog` | every line of `internal/syslog/testdata/corpus.txt`, as RFC 3164 over UDP and RFC 5424 over TCP (both framings), gives exactly the expected alerts |
+| `TestSyslog` | every line of `internal/syslog/testdata/corpus.txt`, as RFC 3164 over UDP and RFC 5424 over TCP (both framings): each line on its own gives exactly its alerts, and lines without an address pair give none |
 | `TestWebsocketUpdates` | score, blocklist, config and whitelist pushes are applied; changed decisions are recommended again |
 | `TestDeliveryRetries` | 429 and 5xx delay delivery without losing messages; a 4xx drops the message for good |
 | `TestRestartKeepsScores` | scores survive a restart, the sensor starts without waiting for a snapshot, and an empty or much smaller snapshot does not wipe them |
