@@ -94,6 +94,41 @@ docker build --build-arg VERSION=dev -t traffic-sensor .
 
 ---
 
+## Testing
+
+`go test ./...` runs the unit tests. The end-to-end tests in `e2e/` run the
+real Docker image, with real packet capture and a real syslog listener,
+against a fake NxtFireGuard backend in the test process. The fake speaks the
+backend's wire format (`/sync*`, the score snapshot as tar.gz, the update
+websocket, `/alert`, `/recommend`, the heartbeat), records what the sensor
+sends and can be scripted to hold back the snapshot, push updates or answer
+with 429, 5xx or 4xx. Traffic comes from small containers at fixed
+addresses on a Docker network of each test's own.
+
+They need Docker on Linux: the sensors reach the fake backend at their
+network's gateway address, which is the host only with native Docker (not
+Docker Desktop or colima on macOS, where CI is the way to run them):
+
+```bash
+go test -tags e2e -v -timeout 20m ./e2e/                  # builds the image first
+E2E_IMAGE=traffic-sensor go test -tags e2e -v ./e2e/      # or test a built image
+```
+
+CI runs them on every pull request and nightly. Covered:
+
+| Test | Behaviour |
+|------|-----------|
+| `TestStartupWaitsForScores` | no capture and no heartbeat until rules and scores are loaded |
+| `TestCapturedTraffic` | a captured connection gives the right alert and recommendation; whitelisted and low scores give none; repeats are deduplicated |
+| `TestSyslog` | every line of `internal/syslog/testdata/corpus.txt`, as RFC 3164 over UDP and RFC 5424 over TCP (both framings), gives exactly the expected alerts |
+| `TestWebsocketUpdates` | score, blocklist, config and whitelist pushes are applied; changed decisions are recommended again |
+| `TestDeliveryRetries` | 429 and 5xx delay delivery without losing messages; a 4xx drops the message for good |
+| `TestRestartKeepsScores` | scores survive a restart, the sensor starts without waiting for a snapshot, and an empty or much smaller snapshot does not wipe them |
+| `TestUpgradeFromV1` | a volume written by v1.0.5 (from Docker Hub) works with this version |
+| `TestBackendDownAtStart` | a backend that comes up after the sensor is picked up without a restart |
+
+---
+
 ## License
 
 This project is part of the **NxtFireGuard** suite developed by **NxtGenIT**. All rights reserved.
