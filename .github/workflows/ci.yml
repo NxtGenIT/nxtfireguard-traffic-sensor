@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Nightly, so a change on Docker Hub or the runners shows up without a PR.
+    - cron: '23 3 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -38,17 +42,34 @@ jobs:
       - name: Vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
-  docker:
+  e2e:
+    # Builds the image and runs it with real packet capture and syslog
+    # against a fake backend (e2e/). See "Testing" in the README.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+
       - uses: docker/setup-buildx-action@v3
+
       - name: Build image
         uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64
           push: false
+          load: true
+          tags: nfg-traffic-sensor:e2e
           build-args: VERSION=ci-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: End-to-end tests
+        env:
+          E2E_IMAGE: nfg-traffic-sensor:e2e
+        run: go test -tags e2e -count=1 -v -timeout 15m ./e2e/

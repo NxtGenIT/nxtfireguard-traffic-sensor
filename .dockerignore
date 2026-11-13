@@ -4,3 +4,4 @@
 data
 sensor-db
 docker-compose.yml
+e2e
