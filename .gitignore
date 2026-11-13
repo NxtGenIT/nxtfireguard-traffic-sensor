@@ -2,4 +2,4 @@
 .vscode
 data
 sensor-db
-docker-compose.yml
+docker-compose.yml.DS_Store
