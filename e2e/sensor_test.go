@@ -256,6 +256,10 @@ func TestSyslog(t *testing.T) {
 	}
 	addr := net.JoinHostPort(e.sensorIP(), fmt.Sprint(syslogPort))
 	wantKeys := alertKeys(want)
+	if len(wantKeys) < 25 {
+		t.Fatalf("only %d expected alerts from the corpus", len(wantKeys))
+	}
+	t.Logf("%d corpus lines, %d distinct alerts expected per transport", len(cases), len(wantKeys))
 
 	check := func(transport string) {
 		t.Helper()
